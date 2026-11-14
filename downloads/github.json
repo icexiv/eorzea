@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "source": "github",
+  "channels": {
+    "stable": null,
+    "dev": {
+      "version": "dev-89f8067",
+      "tag": "dev-build",
+      "commit": "89f80674eb569a499e624c19d1a7fa2507584844",
+      "build": 0,
+      "published_at": "2026-11-10T13:08:20Z",
+      "assets": {
+        "linux-x86_64": {
+          "filename": "eorzea-app-dev-linux-x86_64",
+          "url": "https://github.com/icexiv/eorzea/releases/download/dev-build/eorzea-app-dev-linux-x86_64",
+          "sha256": "37cb00249ad8ea1c634917eb5e29932b7eef23d9f3e7147e58b111d9f82e5e2e",
+          "size": 36457448,
+          "experimental": false
+        },
+        "macos-aarch64": {
+          "filename": "eorzea-app-dev-macos-aarch64",
+          "url": "https://github.com/icexiv/eorzea/releases/download/dev-build/eorzea-app-dev-macos-aarch64",
+          "sha256": "5ad70b80ada5ddd5c0f88695962d6f491c545dc58cd1b1ffbc6c3bee0a9088c7",
+          "size": 26249008,
+          "experimental": true
+        },
+        "windows-x86_64": {
+          "filename": "eorzea-app-dev-windows-x86_64.exe",
+          "url": "https://github.com/icexiv/eorzea/releases/download/dev-build/eorzea-app-dev-windows-x86_64.exe",
+          "sha256": "0ff18d0c555feae0bf8a4b9a9ab1bc56db7e24725b7eeb3babce38e0945ccb03",
+          "size": 31591424,
+          "experimental": false
+        }
+      }
+    }
+  }
+}
