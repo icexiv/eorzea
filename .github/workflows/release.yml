@@ -193,7 +193,12 @@ jobs:
       - name: Read published release
         env:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
-        run: gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release-info.json
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release-info.json
+          release_id=$(jq -r .id release-info.json)
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$RUNNER_TEMP/release-assets.json"
+          jq --slurpfile pages "$RUNNER_TEMP/release-assets.json" '.assets = ($pages[0] | add)' release-info.json > "$RUNNER_TEMP/release-info-full.json"
+          mv "$RUNNER_TEMP/release-info-full.json" release-info.json
       - name: Generate GitHub-only manifest
         run: |
           python3 scripts/release.py manifest --repo publication --directory release-assets \
@@ -210,7 +215,9 @@ jobs:
             git pull --rebase origin main
             git push origin HEAD:main
           fi
-      - name: Install Shadow
+      - name: Install Rust for Shadow
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build pinned Shadow CLI
         run: cargo install --git https://github.com/AzurIce/shadow --rev 7a357b12984e2f13aab7259391e98a729d99e67f --locked -j 2
       - name: Stage current channel packages
         run: python3 scripts/release.py stage --repo publication --directory release-assets --channel "$CHANNEL"
