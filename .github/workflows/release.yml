@@ -1,81 +1,70 @@
 name: Release
 
-# 稳定版：推送 v* tag 构建三平台产物并发布 GitHub Release。
-# Dev 版：手动 Run workflow（默认发布），构建后覆盖固定的 `dev-build` pre-release；
-#         不随 push main 自动构建。手动关闭 publish_dev 时只上传 Actions artifact。
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["downloads/**", ".shadow/**"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       publish_dev:
-        description: "发布/更新 Development build（固定 tag: dev-build，替换旧资产）"
+        description: Publish dev-build from main
         type: boolean
         default: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
-
-# 手动构建共用一组，避免不同分支同时修改滚动 Release。
-# 不取消进行中的任务，防止附件上传到一半被中断。
-concurrency:
-  group: release-${{ github.event_name == 'push' && github.ref_name || 'development-build' }}
-  cancel-in-progress: false
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   plan:
-    name: plan
     runs-on: ubuntu-latest
     outputs:
       channel: ${{ steps.plan.outputs.channel }}
       publish: ${{ steps.plan.outputs.publish }}
       version: ${{ steps.plan.outputs.version }}
-      short_sha: ${{ steps.plan.outputs.short_sha }}
-      date: ${{ steps.plan.outputs.date }}
+      tag: ${{ steps.plan.outputs.tag }}
     steps:
       - id: plan
-        shell: bash
         env:
-          DEV_RELEASE: ${{ inputs.publish_dev }}
-          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH_DEV: ${{ inputs.publish_dev }}
         run: |
-          short_sha="${GITHUB_SHA::7}"
-          date="$(date -u +'%Y-%m-%d %H:%M UTC')"
-          if [ "$EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+          channel=none
+          publish=false
+          version="dev-${GITHUB_SHA::7}-$GITHUB_RUN_NUMBER-$GITHUB_RUN_ATTEMPT"
+          tag=dev-build
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
             channel=stable
             publish=true
             version="$GITHUB_REF_NAME"
-          elif [ "$DEV_RELEASE" = "true" ]; then
+            tag="$GITHUB_REF_NAME"
+          elif [ "$GITHUB_REF" = refs/heads/main ] && { [ "$GITHUB_EVENT_NAME" = push ] || [ "$PUBLISH_DEV" = true ]; }; then
             channel=dev
             publish=true
-            # 固定版本号 => 资产名固定（<binary>-dev-<os>），下次构建直接替换
-            version=dev
-          else
-            channel=none
-            publish=false
-            version="dev-$short_sha"
           fi
           {
             echo "channel=$channel"
             echo "publish=$publish"
             echo "version=$version"
-            echo "short_sha=$short_sha"
-            echo "date=$date"
+            echo "tag=$tag"
           } >> "$GITHUB_OUTPUT"
 
   build:
-    name: build (${{ matrix.name }})
     needs: plan
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # 用 22.04 构建以保持较低的 glibc 下限（22.04 = 2.35）。
           - os: ubuntu-22.04
             name: linux-x86_64
             target: x86_64-unknown-linux-gnu
@@ -84,8 +73,6 @@ jobs:
             name: windows-x86_64
             target: x86_64-pc-windows-msvc
             experimental: false
-          # macOS 尚未在真机上验证，失败不阻塞 Linux/Windows 发布。
-          # 固定受支持的 Apple Silicon runner，保持 aarch64 产物。
           - os: macos-15
             name: macos-aarch64
             target: aarch64-apple-darwin
@@ -93,62 +80,45 @@ jobs:
     continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test release tooling
+        if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s scripts/tests -v
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-
-      # 构建期需要：pkg-config；openssl（blitz-net 的 reqwest 走 native-tls）；
-      # fontconfig（fontique 的 Linux 后端，build.rs 用 pkg-config 探测）。
-      # wayland/xkbcommon 走 dlopen，运行时才需要，构建阶段不用装。
-      - name: Install Linux build dependencies
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libfontconfig1-dev
-
-      - name: Build release binaries
-        run: >
-          cargo build --release --locked
-          --target ${{ matrix.target }}
-          -p eorzea-app -p eorzea-cli
-
-      - name: Prepare release assets
+      - name: Build independent App and CLI binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p eorzea-app -p eorzea-cli
+      - name: Package App and CLI separately
         shell: bash
         env:
           BUILD_VERSION: ${{ needs.plan.outputs.version }}
           BUILD_PLATFORM: ${{ matrix.name }}
           BUILD_TARGET: ${{ matrix.target }}
         run: |
-          mkdir -p dist
-          extension=""
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            extension=".exe"
-          fi
-          for binary in eorzea-app eoz; do
-            name="$binary-$BUILD_VERSION-$BUILD_PLATFORM$extension"
-            cp "target/$BUILD_TARGET/release/$binary$extension" "dist/$name"
-            if [ "$RUNNER_OS" != "Windows" ]; then
-              strip "dist/$name" || true
-            fi
-          done
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          python scripts/release.py package --target "target/$BUILD_TARGET/release" \
+            --platform "$BUILD_PLATFORM" --version "$BUILD_VERSION" --output dist
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/*
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.dmg
           if-no-files-found: error
           retention-days: 7
 
   release:
-    name: publish release
     needs: [plan, build]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
@@ -159,99 +129,155 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-
-      # 仅在构建成功后移动滚动 tag；不操作同名分支。
-      - name: Update development build tag
+      - name: Update rolling Dev tag after builds succeed
         if: needs.plan.outputs.channel == 'dev'
         uses: actions/github-script@v7
         with:
           script: |
-            const repo = context.repo;
             const ref = 'tags/dev-build';
             try {
-              await github.rest.git.getRef({ ...repo, ref });
+              await github.rest.git.getRef({ ...context.repo, ref });
             } catch (error) {
               if (error.status !== 404) throw error;
-              await github.rest.git.createRef({
-                ...repo, ref: `refs/${ref}`, sha: context.sha,
-              });
+              await github.rest.git.createRef({ ...context.repo, ref: `refs/${ref}`, sha: context.sha });
               return;
             }
-            await github.rest.git.updateRef({
-              ...repo, ref, sha: context.sha, force: true,
-            });
-
-      - name: Get UTC release date
-        if: needs.plan.outputs.channel == 'dev'
-        id: release_date
-        shell: bash
-        run: echo "date=$(date -u +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
-
-      # 固定附件名，下载链接不会随构建改变。
-      - name: Publish dev pre-release
-        if: needs.plan.outputs.channel == 'dev'
-        uses: softprops/action-gh-release@v2
+            await github.rest.git.updateRef({ ...context.repo, ref, sha: context.sha, force: true });
+      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: dev-build
+          tag_name: ${{ needs.plan.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: Dev Build ${{ steps.release_date.outputs.date }}
-          body: |
-            `${{ github.ref_name }}` 的 dev 构建，**非稳定版本**。
-
-            ### 下载说明
-
-            - **eorzea-app**：图形界面（GUI），普通用户通常选择这个。
-            - **eoz**：命令行工具（CLI），在终端中使用；不需要同时下载 GUI。
-            - Windows 下载对应的 `.exe` 直接运行；需要 `eoz` 命令时，可将 CLI 文件重命名为 `eoz.exe` 并加入 `PATH`。
-            - Linux / macOS 下载对应的二进制文件，执行 `chmod +x <文件名>` 后运行；CLI 文件可重命名为 `eoz` 并加入 `PATH`。
-
-            ### 构建信息
-
-            - 提交：${{ github.sha }}
-            - 时间：${{ needs.plan.outputs.date }}
-            - 构建：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-            资产会在下一次 dev build 时被替换；需要稳定版请使用 `v*` tag 的 Release。
-          prerelease: true
-          make_latest: false
+          name: ${{ needs.plan.outputs.version }}
+          prerelease: ${{ needs.plan.outputs.channel == 'dev' || contains(github.ref_name, '-') }}
+          make_latest: ${{ needs.plan.outputs.channel == 'stable' && !contains(github.ref_name, '-') && 'true' || 'false' }}
+          generate_release_notes: ${{ needs.plan.outputs.channel == 'stable' }}
           files: dist/*
           fail_on_unmatched_files: true
+          body: |
+            App（GUI）和 eoz（CLI）独立打包，无需同时安装。
+            Windows 解压 ZIP，Linux 解压 tar.gz 后运行。
+            macOS App 使用 DMG 拖拽安装，CLI 使用 tar.gz；macOS 尚未真机验证，未签名或公证。
+            Dev 附件按构建区分，下载清单展示最新构建，旧附件至少保留 30 天。
+            Commit: ${{ github.sha }}
 
-      # macOS 为可选任务：本次失败时移除其旧附件，避免混入上次构建。
-      # 同时移除不再发布的附件名，避免旧的合并包与独立附件混用。
-      - name: Remove stale development assets
+  downloads:
+    name: Publish download manifests and TOS mirror
+    needs: [plan, release]
+    if: needs.plan.outputs.publish == 'true' && (needs.plan.outputs.channel == 'dev' || !contains(github.ref_name, '-'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: eorzea-download-state
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CHANNEL: ${{ needs.plan.outputs.channel }}
+      BUILD_VERSION: ${{ needs.plan.outputs.version }}
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST || 'deploy@82.156.196.54' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          path: publication
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read published release
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release-info.json
+          release_id=$(jq -r .id release-info.json)
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$RUNNER_TEMP/release-assets.json"
+          jq --slurpfile pages "$RUNNER_TEMP/release-assets.json" '.assets = ($pages[0] | add)' release-info.json > "$RUNNER_TEMP/release-info-full.json"
+          mv "$RUNNER_TEMP/release-info-full.json" release-info.json
+      - name: Generate GitHub-only manifest
+        run: |
+          python3 scripts/release.py manifest --repo publication --directory release-assets \
+            --channel "$CHANNEL" --source github --release release-info.json \
+            --commit "$GITHUB_SHA" --version "$BUILD_VERSION" --build "$GITHUB_RUN_NUMBER"
+      - name: Commit GitHub download state
+        working-directory: publication
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add downloads/github.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: update GitHub App downloads'
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+      - name: Install Rust for Shadow
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build pinned Shadow CLI
+        run: cargo install --git https://github.com/AzurIce/shadow --rev 7a357b12984e2f13aab7259391e98a729d99e67f --locked -j 2
+      - name: Stage current channel packages
+        run: python3 scripts/release.py stage --repo publication --directory release-assets --channel "$CHANNEL"
+      - name: Publish mirror and verify refs
+        env:
+          TOS_ACCESS_KEY: ${{ secrets.TOS_ACCESS_KEY }}
+          TOS_SECRET_KEY: ${{ secrets.TOS_SECRET_KEY }}
+          TOS_SECURITY_TOKEN: ${{ secrets.TOS_SECURITY_TOKEN }}
+        run: |
+          shadow -C publication restore
+          shadow -C publication publish --attachment
+          shadow -C publication check --remote
+      - name: Generate TOS-only manifest
+        run: |
+          python3 scripts/release.py manifest --repo publication --directory release-assets \
+            --channel "$CHANNEL" --source tos --release release-info.json \
+            --commit "$GITHUB_SHA" --version "$BUILD_VERSION" --build "$GITHUB_RUN_NUMBER"
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Atomically publish server manifest
+        run: |
+          rsync -t --chmod=F644 publication/downloads/tos.json "$DEPLOY_HOST:eorzea.json.$GITHUB_RUN_ID.tmp"
+          # shellcheck disable=SC2029
+          ssh "$DEPLOY_HOST" "publish-manifest eorzea.json.$GITHUB_RUN_ID.tmp"
+      - name: Commit mirror refs and manifest
+        working-directory: publication
+        run: |
+          git add .shadow/refs/published downloads/tos.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: update TOS App downloads and Shadow refs'
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+      - name: Release superseded TOS objects after publishing
+        env:
+          TOS_ACCESS_KEY: ${{ secrets.TOS_ACCESS_KEY }}
+          TOS_SECRET_KEY: ${{ secrets.TOS_SECRET_KEY }}
+          TOS_SECURITY_TOKEN: ${{ secrets.TOS_SECURITY_TOKEN }}
+        run: shadow -C publication free --keep-at origin/main --delete
+      - name: Retire old Dev attachments after publishing
         if: needs.plan.outputs.channel == 'dev'
         uses: actions/github-script@v7
         with:
           script: |
+            const { data: release } = await github.rest.repos.getReleaseByTag({ ...context.repo, tag: 'dev-build' });
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, { ...context.repo, release_id: release.id, per_page: 100 });
+            const cutoff = Date.now() - 30 * 86400000;
             const fs = require('fs');
-            const names = new Set(fs.readdirSync('dist'));
-            const repo = context.repo;
-            const { data: release } = await github.rest.repos.getReleaseByTag({
-              ...repo, tag: 'dev-build',
-            });
-            const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
-              ...repo, release_id: release.id, per_page: 100,
-            });
+            const current = new Set(fs.readdirSync('release-assets'));
             for (const asset of assets) {
-              if (!names.has(asset.name)) {
-                await github.rest.repos.deleteReleaseAsset({ ...repo, asset_id: asset.id });
+              if (!current.has(asset.name) && Date.parse(asset.created_at) < cutoff) {
+                await github.rest.repos.deleteReleaseAsset({ ...context.repo, asset_id: asset.id });
               }
             }
-
-      - name: Publish stable release
-        if: needs.plan.outputs.channel == 'stable'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          body: |
-            ### 下载说明
-
-            - **eorzea-app**：图形界面（GUI），普通用户通常选择这个。
-            - **eoz**：命令行工具（CLI），在终端中使用；不需要同时下载 GUI。
-            - Windows 下载对应的 `.exe` 直接运行；需要 `eoz` 命令时，可将 CLI 文件重命名为 `eoz.exe` 并加入 `PATH`。
-            - Linux / macOS 下载对应的二进制文件，执行 `chmod +x <文件名>` 后运行；CLI 文件可重命名为 `eoz` 并加入 `PATH`。
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          # v0.2.0-beta.1 这类 tag 自动标为 pre-release
-          prerelease: ${{ contains(github.ref_name, '-') }}

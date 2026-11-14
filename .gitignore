@@ -30,3 +30,13 @@ result
 
 # Local OpenChamber files
 /.openchamber/
+# Release bodies live in TOS; only refs and manifests are committed.
+/publication/
+/release-assets/
+/release-state.json
+/release-info.json
+
+/.env
+
+# shadow
+/published/**
