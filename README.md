@@ -29,6 +29,11 @@
 
 运行 `eorzea-app`，在设置中选择游戏目录，添加账号并登录，然后启动游戏。
 
+GUI 使用 **Iced + tiny-skia 软件渲染**，不使用 WebView 或 GPU 渲染后端。Linux 需要 Wayland/X11
+运行库；GUI 本身不需要 Vulkan（通过 Wine/DXVK 运行游戏的要求独立）。中文字体从系统查找；
+缺少时安装 Noto Sans CJK，或通过 `EORZEA_FONT=/path/to/font.ttf`
+指定字体文件。账号和配置格式与 CLI 保持兼容。
+
 ### 命令行
 
 将 `eoz` 加入 `PATH`，或在下列命令中使用它的完整路径：
@@ -60,6 +65,19 @@ cargo run -p eorzea-app
 # 命令行
 cargo run -p eorzea-cli -- --help
 ```
+
+仅编译/无窗口验证：
+
+```bash
+cargo check --locked -p eorzea-app -p eorzea-auth -p eorzea-cli -j2
+cargo test --locked -p eorzea-app -j2 -- --test-threads=2
+```
+
+GUI 测试使用内存 Iced 控件及 tiny-skia，不打开桌面窗口，不读取真实账号或执行登录/更新/启动。
+开发架构及验证边界见 [GUI 文档](docs/gui.md)。
+
+发行构建使用 `cargo build --locked --release -p eorzea-app -j2`，启用 thin LTO 和符号裁剪。
+debug 文件含调试信息，不能当作发行体积；可执行文件大小也不等于运行内存。
 
 ## 文档
 

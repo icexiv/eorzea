@@ -1,24 +1,32 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-// UI 组件在本 crate（`eorzea_app`）；核心逻辑在 lib（`eorzea`）。
-// 这里只做平台入口分发：
-// - 桌面：dioxus-native（Blitz 渲染）
-// - wasm：dioxus web（`dx serve --platform web` 浏览器调试）
-
+mod clipboard;
 mod logging;
 mod ui;
 
-#[cfg(not(target_arch = "wasm32"))]
-fn main() {
+fn main() -> iced::Result {
     logging::init();
-    let window = dioxus_native::WindowAttributes::default()
-        .with_title("FFXIV 国服启动器")
-        .with_inner_size(dioxus_native::LogicalSize::new(720.0, 860.0));
-    dioxus_native::launch_cfg(ui::app, vec![], vec![Box::new(window)]);
-}
-
-#[cfg(target_arch = "wasm32")]
-fn main() {
-    dioxus::launch(ui::app);
+    tracing::info!("GUI renderer: Iced / tiny-skia (CPU software rendering)");
+    let fonts = ui::theme::system_fonts();
+    let mut app = iced::application(ui::App::new, ui::App::update, ui::App::view)
+        .executor::<ui::Executor>()
+        .title("FFXIV 国服启动器")
+        .window(iced::window::Settings {
+            size: iced::Size::new(720., 860.),
+            min_size: Some(iced::Size::new(620., 600.)),
+            exit_on_close_request: false,
+            ..Default::default()
+        })
+        .settings(iced::Settings {
+            default_text_size: 14.into(),
+            ..Default::default()
+        })
+        .default_font(fonts.font)
+        .theme(ui::theme::theme())
+        .subscription(ui::App::subscription);
+    for bytes in fonts.bytes {
+        app = app.font(bytes);
+    }
+    app.run()
 }

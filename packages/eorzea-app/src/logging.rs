@@ -3,7 +3,7 @@
 //! 桌面端没有控制台（Windows release 尤其如此），启动链路（Dalamud 下载、
 //! 自动登录、wine 探测等）的日志只在终端可见。这里用一个额外的
 //! [`tracing_subscriber::Layer`] 把 INFO 及以上级别的事件写入全局环形缓冲，
-//! UI 定时增量读取后渲染。
+//! UI 被日志事件唤醒后增量读取，不依赖常驻轮询/重绘定时器。
 
 use std::collections::VecDeque;
 use std::fmt::Debug;
@@ -32,6 +32,15 @@ pub struct LogEntry {
     pub text: String,
 }
 
+/// 保留原始时间顺序和级别，便于粘贴后分析启动过程。
+pub fn format_for_copy(entries: &[LogEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 全局保留的最大行数（超出丢弃最旧的）。
 const MAX_LINES: usize = 1000;
 /// UI 侧最多渲染的行数。
@@ -51,6 +60,11 @@ static STORE: LazyLock<Mutex<Store>> = LazyLock::new(|| {
 });
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+static WAKE: Mutex<Option<std::sync::Arc<tokio::sync::Notify>>> = Mutex::new(None);
+
+pub fn set_wakeup(wake: std::sync::Arc<tokio::sync::Notify>) {
+    *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake);
+}
 
 /// 安装全局 subscriber：控制台 fmt 输出 + UI 环形缓冲。
 ///
@@ -84,6 +98,10 @@ fn push(entry: LogEntry) {
     store.lines.push_back(entry);
     while store.lines.len() > MAX_LINES {
         store.lines.pop_front();
+    }
+    drop(store);
+    if let Some(wake) = WAKE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        wake.notify_one();
     }
 }
 
@@ -148,6 +166,25 @@ impl Visit for Visitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_preserves_order_and_text() {
+        assert_eq!(format_for_copy(&[]), "");
+        let entries = vec![
+            LogEntry {
+                level: LogLevel::Info,
+                text: "INFO 启动 C:\\游戏".into(),
+            },
+            LogEntry {
+                level: LogLevel::Error,
+                text: "ERROR 失败\n详情".into(),
+            },
+        ];
+        assert_eq!(
+            format_for_copy(&entries),
+            "INFO 启动 C:\\游戏\nERROR 失败\n详情"
+        );
+    }
 
     #[test]
     fn snapshot_returns_only_new_lines() {

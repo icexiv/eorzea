@@ -216,17 +216,27 @@
 
 ### P4-2.5 GUI UX 修正
 
+- [x] **正式 GUI 使用 Iced/tiny-skia 软件渲染**：`eorzea-app` 使用 Iced 0.14，仅启用 tiny-skia，不含 wgpu/glow/egui/Dioxus/Blitz 或 sysinfo 运行依赖。主页、账号/扫码/推送/密码、Wine/Dalamud/下载设置复用真实核心与配置格式；业务和 Iced executor 共用两个 Tokio worker，结果/最新进度/日志通过 Notify 订阅唤醒。release 启用 thin LTO 和符号裁剪。架构及无窗口验证见 [`docs/gui.md`](docs/gui.md)。
+- [ ] **Iced 原生与跨平台验收**：用户禁止擅自在工作桌面开窗口，当前仅编译/内存 Iced/tiny-skia 布局绘制与状态回归；真实窗口、中文 IME 候选、剪贴板/portal、无障碍和 Windows/macOS 需在获准或真正隔离环境验证，真实登录/发行补丁/启动也不由内存测试代替。不将研究原型的 RAM/CPU 数据当作正式程序结果。
+
+- [x] **运行日志复制**：全局日志抽屉提供显式「复制全部」按钮，复制当前保留日志（按时间从旧到新）；显示空日志、复制成功及剪贴板失败反馈。
+- [x] **日志文字选择**：使用只读 Iced TextEditor，支持跨行拖选、Ctrl/Cmd+A、Ctrl/Cmd+C 复制所选，保留各记录及多行详情的级别色；拒绝输入、粘贴、剪切和编辑操作。选中/滚动阅读时暂停文本区跟随，底栏继续显示最新日志；「跟随最新」恢复当前日志并清除选区。只读适配关闭 IME 和光标闪烁重绘，文本选择/复制使用内存控件与模拟剪贴板回归，原生剪贴板仍待平台验收。
+- [x] **启动按钮居中与悬停反馈**：「启动游戏」「启动中…」在 56px 按钮内显式水平和垂直居中；主/次/弱/危险按钮、分段按钮及导航补充 hover/pressed 状态。可用按钮悬停改变表面/边框/文字，禁用按钮不高亮、不触发按下动画；无窗口布局和实际像素回归防止再次偏移或样式无变化。
+- [x] **全局底边栏与日志抽屉**：36px 底栏左侧显示编译时启动器版本，右侧显示最新真实日志，单行预览/全文提示及日志级别色；按钮展开全局可滚动、可复制日志抽屉，切页保留展开和滚动状态，主页不再重复放日志卡。操作结果独立显示 6 秒提示，新的日志和过期的旧提示不会覆盖它。
+- [x] **日志抽屉动画裁剪**：位移/缩放后的子控件接收逆变换后的固定裁剪视口，嵌套文字、选区和按钮图层不能越过底栏。CPU 像素回归在控件创建后建立合成时钟基准，复用控件树及动画帧布局，覆盖收起、完全关闭、重开和中途反转，并在普通/150% 缩放下逐像素检查底栏及动画结束帧。
+- [x] **Iced 轻量动效与层级精修**：使用内置 `Animation`，抽屉 200ms ease-out 位移、按钮 100ms 按下反馈；状态保存在控件内，仅过渡时请求绘制，不发送逐帧应用消息、不使主页面每帧重排，完成后停止请求。`EORZEA_REDUCED_MOTION=1` 关闭动效。摘要卡改用轻底色，保留白色/zinc、现有导航与业务布局；未引入动画/组件库或 GPU features。调查见 [`docs/gui-motion.md`](docs/gui-motion.md)，真实平台流畅度仍待获准测试。
+
 - [x] **GUI/CLI 共用账号启动流程与票据生命周期**：两者统一调用 `Launcher::launch_account(LaunchRequest, on_event)`，核心库负责游戏预检 → Dalamud 准备 → 读取最新凭据 → 自动登录 → 保存轮换 key → 创建游戏进程。GUI 移除 `AppState.tokens`，每次启动及失败重试都重新换取 ticket；界面只提供参数并展示事件。回归测试覆盖同一 Launcher 连续重试、默认账号/名称/ID 选择、认证失败及预检失败不启动。
 - [x] **GUI/CLI 自动登录凭据同步**：共享启动流程每次读取磁盘凭据，保存时重读并仅合并本账号的轮换 key，保留其他账号、默认账号与大区；启动认证使用文件锁防止两次启动同时轮换，发现凭据被其他操作修改时中止而不覆盖。GUI 修改账号元数据前也重新读盘。回归测试覆盖外部凭据轮换、认证期间元数据变更与 key 冲突。
 - [ ] **账号配置写入原子性与统一互斥**：`auth::save` 直接覆盖文件，非启动的账号管理写操作尚未接入启动认证锁。需统一读改写互斥及原子替换，覆盖保存中断和账号管理与启动同时写入；当前启动流程的重读合并与 key 比较不能消除最终检查到写入之间的竞争窗口。
 - [ ] **GUI 产品级主路径与恢复设计**：审查与建议见 [`docs/gui-ux-review.md`](docs/gui-ux-review.md)。首次配置需按缺失条件引导；主操作首屏可见；登录失效提供绑定原账号的重新登录入口；错误应有原位恢复动作，而非只写可被覆盖的全局状态字符串。
-- [ ] **GUI 更新任务生命周期与启动互斥**：更新状态/补丁列表仍属主页局部 signal，检查/下载/安装使用页面 scope 的 spawn；切页卸载存在取消任务、丢失进度和中断安装风险。需改应用级任务并定义安全退出/取消边界；更新与启动当前只分别防自身重入，须按游戏目录互斥，禁止安装与启动冲突。
-- [ ] **GUI 添加账号持久化失败的原位恢复**：保存失败不再更新内存账号或关闭弹窗；共享启动流程保存轮换 key 失败时会报错并中止启动。添加账号的保存错误仍只显示在全局状态栏，需在扫码/推送/密码弹窗内展示并提供明确重试入口。
-- [ ] **GUI 设置草稿保护与字段校验**：设置切页后局部草稿会丢失，无离开确认；初始化延迟非法输入静默回退且 dirty 判断可能忽略非法值，缺少毫秒单位。需保护草稿、标注单位、字段报错并阻止非法保存；开关/同步选项补键盘操作与可访问名称。
-- [ ] **GUI 状态准确性**：区域列表请求失败后空列表仍显示加载中；游戏版本 memo 仅依赖路径，更新完成需主动刷新；Wine 摘要 detect 与所选 startup_type 解析不完全等价；Dalamud 摘要需与本次加载覆盖一致。
+- [x] **GUI 更新任务生命周期与启动互斥**：根 `App` 持有操作状态、补丁列表和进度，Tokio任务独立于页面；更新/检查/启动互斥，账号/设置保存也阻止与关键操作并发。普通关闭请求在更新/启动/保存期间被拦截，可等待任务完成后退出；不提供直接 abort 真实补丁提交的演示取消按钮。强杀/断电继续依赖核心队列恢复。
+- [x] **GUI 添加账号持久化失败的原位恢复**：错误显示在登录弹窗，保存失败不更新账号镜像、不关闭弹窗；保留登录结果供「重试保存账号」，无需重新扫码。密码不进入配置或日志。
+- [x] **GUI 设置草稿保护与字段校验**：草稿归根状态，切页不丢失；退出前确认未保存草稿。最大/最少并发及毫秒延迟均校验，非法输入保持dirty且禁止保存；使用真实 Iced 输入/按钮/复选框而非绘制占位，完整平台键盘/可访问性另行验收。
+- [ ] **GUI 状态准确性**：大区失败状态与重试、更新完成版本刷新、本次Dalamud覆盖摘要已接入；Wine 卡片明确标注「本地探测」，detect 与所选 startup_type 最终解析仍不完全等价，需无下载副作用的精确摘要接口。
 - [ ] **GUI 账号组选择**：核心支持账号组与 poll/finalize，但 GUI 使用 wait_for_scan/wait_for_confirm 直接完成默认账号；多账号组应提供选择步骤，单账号不增加操作。
 
-- [x] **空输入框默认值提示**：placeholder 只显示实际非空默认值，没有默认值的游戏目录、自定义 Wine 路径、账号和密码保持空白，说明放在框外。共享输入框在原生端为缺少 placeholder 绘制支持的 Blitz 补充提示层；空值显示，输入后隐藏，清空恢复，提示不写入 value。浏览器保留原生 placeholder。Prefix、Dalamud 安装目录与初始化延迟的 placeholder 直接读取运行时默认路径及 DalamudSettings::default()，不在 UI 硬编码默认值。
+- [x] **空输入框默认值提示**：Iced TextInput 的 placeholder 只显示实际默认值，没有默认值的游戏目录、自定义 Wine 路径、账号和密码保持空白；提示不写入 value。Prefix、Dalamud 安装目录与延迟提示来自运行时默认路径和 DalamudSettings::default()。
 
 - [x] **默认大区改为账号级（2026-11-02）**：`auth.toml` 的每个账号新增可选 `area`；GUI 主页「大区」下拉框直接读写当前账号，切换账号时自动套用；设置页移除全局「默认大区」输入（旧 `config.toml` 的 `area` 仅作回退保留，不再编辑）。解析顺序：`--area` → 账号 `area` → 旧 `config.toml.area` → 大区列表第一个（隐式选择并提示）。新账号继承添加时选中的大区，session key 刷新不会清掉已保存的 area。
 - [x] **大区只暴露名称（2026-11-02）**：`auth.toml` / 旧 `config.toml` 的 `area` 现在保存并展示大区名称（对齐 XIVLauncherCN 的 `AreaName`），数字 `Areaid` 只在内部构造 `-AreaID` 和补丁地址时使用；兼容读取旧数字 ID。`eoz areas` 不再输出 ID 列，`--area` 接受名称。GUI 新建账号、切换账号、修改大区都按名称读写。
@@ -235,22 +245,23 @@
 - [x] **账号管理卡片与添加弹窗**：账号以卡片展示，移除冗余的手动自动登录按钮，当前默认按钮禁用并显示「默认」；扫码/推送/密码收进添加弹窗，默认自动获取二维码、可刷新，密码表单提供明确标签。切换方式或关闭弹窗取消本地任务，登录成功后留在账号页；设默认/删除失败不更新内存为成功状态。
 - [x] **添加账号方式标签**：三个等宽按钮显式水平/垂直居中，名称明确为「叨鱼扫码登录」「叨鱼推送登录」「密码登录」。
 
-- [x] **下拉菜单视觉改进**：SVG 箭头固定右侧，当前选项显示勾选；长标签用块级元素换行，不再使用 span 裁剪结构；展开时强调外框，支持 Escape 收起，保留 Blitz 兼容的内联展开方式。
-- [ ] **原生文字区域细线**：用户截图显示淡色横线，清除装饰线及改用 overflow: clip 均无效；生产 GUI 的 span 已全部换为 div，需原生运行确认，根因尚未确定。上游未找到完全一致 issue，相关 Blitz #256/#340/#888 不能视作相同根因；调查与无凭据对照示例见 [`docs/notes/gui-span-rendering.md`](docs/notes/gui-span-rendering.md)。
+- [x] **下拉菜单交互**：Iced 下拉内联展开、当前项勾选、Escape/背景点击收起、切页收起和全局展开互斥，支持自定义 Dalamud 通道回显。
+- [ ] **原生文字区域细线复验**：Blitz 截图的淡色横线根因未确定；更换框架不能视作实机现象已确认消失。待原生验收；调查保留于 [`docs/notes/gui-span-rendering.md`](docs/notes/gui-span-rendering.md)。
 
-- [x] **图标侧边栏**：导航收窄至 72px，游戏/账号使用 SVG 图标，设置固定底部；保留按钮名称、悬停提示与当前页语义，移除亮/暗主题切换入口。页面内容和登录流程不变。
+- [x] **图标侧边栏**：导航宽 72px，游戏/账号使用 SVG 图标，设置固定底部；提供悬停提示与当前页高亮，不提供亮/暗主题切换入口。
+- [ ] **Iced 无障碍与完整键盘导航**：Tab/Shift-Tab 控件焦点遍历与 Escape 已接入，secure input 合成事件通过无窗口测试；图标导航/分段按钮的键盘激活、模态焦点限制和系统读屏语义尚需平台验证，不能等同于完整无障碍支持。
 
-- [x] **首次启动默认登录页**：无账号或无 `game_path` 时默认 Tab 为登录页，而不是空主页
-- [x] **启动流程不阻塞且跨页面保持**：启动任务使用 root scope 的 `spawn_forever`，`launching` 位于 `AppState`；Wine 探测、prefix 初始化、winepath、Injector 等待、登录 DLL 检查/复制、Wine/DXVK 解压安装、Dalamud release/runtime 解压与文件校验均在阻塞线程池执行，下载写盘使用异步 I/O 或后台线程。解压进度通过有界的最新值通道回到调用线程，UI signal 不跨线程读写；启动中切换页面不会取消任务。单线程 runtime 测试覆盖后台执行、实时进度回传、worker 错误和假 Wine 启动链路。
+- [x] **首次启动按缺失条件进入页面**：无账号进入账号页，已有账号但无游戏目录进入设置页，否则进入主页。
+- [x] **启动流程不阻塞且跨页面保持**：根 App 的 Tokio runtime 执行真实共享启动流程，操作状态不属于页面；Wine/prefix/Injector/DLL/解压/校验等阻塞任务继续由核心移出async worker。GUI通过事件和合并的最新进度回主线程，不跨线程读写UI状态；切页不取消任务。核心mock启动回归与GUI内存状态回归分别覆盖业务和前台生命周期。
 - [ ] **归档盘符校验**：Linux 上 `dalamud::archive::tests::test_safe_relative_path_rejects_escape` 失败，`safe_relative_path` 未拒绝 `C:\Windows\evil.dll`；需跨平台显式识别 Windows 盘符，不能只依赖宿主 `Path` 的组件解析。
-- [x] **Web 预览编译**：`GameFileManager` 的 `connect_timeout/read_timeout` 仅在原生平台设置，wasm32 GUI 检查通过；浏览器预览不执行原生补丁安装。
-- [x] **主页运行日志（2026-11-09）**：新增 `logging.rs`（`tracing` Layer + 1000 行环形缓冲），INFO/WARN/ERROR 增量汇入 `AppState.logs`，主页新增「运行日志（最新在上）」区域并按级别着色；默认只开本项目 INFO 级日志，`RUST_LOG` 可覆盖。
+- [x] **GUI 验证边界**：Iced 前端为原生应用，不提供 Dioxus/wasm 浏览器调试入口；核心库独立的 wasm 平台门控保留。测试用隔离根状态、内存控件和 CPU 绘图，不调用真实认证、补丁安装或游戏启动。
+- [x] **全局运行日志**：`logging.rs` 的 tracing Layer + 1000行缓冲通过通知唤醒 Iced，增量汇入根 App（最多显示300行）；底栏预览最新一条，展开后最新在上并按级别着色；默认只开本项目 INFO，`RUST_LOG` 可覆盖。复制保留时间从旧到新的原始顺序。
 - [x] **密码安全与重复提交**：密码登录成功后清空密码；登录/启动/检查更新增加 busy 防重入
 - [x] **删除账号二次确认**：避免误触立即删除本地账号配置
 - [x] **更新进度可读**：补丁下载进度显示 MiB/GiB 而非裸字节
 - [x] **主页 Dalamud 状态卡**：改为异步获取 release 元数据 + 安装/版本/runtime 状态，不再在 render 中同步读盘并显示误导性的“启动时自动校验/更新”
 - [x] **设置页补全**：新增 Dalamud section（enabled/load_method/track/delay/safe mode）与游戏路径即时校验、msync 开关；主页新增“本次启动加载 Dalamud”会话级开关
-- [x] **Web 预览调试入口（2026-09-12）**：`ui` 移入 lib、`main.rs` 双平台入口（桌面 dioxus-native / wasm dioxus-web），`dx serve --platform web` 浏览器调 UI；wasm 适配（tokio 去 net、reqwest 去 native-tls、rfd/spawn_blocking/chunk() 流式下载平台门控）
+- [x] **原生 GUI 入口与调查解耦**：正式入口为 Iced/tiny-skia，Dioxus span 对照源码独立保存在文档 fixture 供调查参考，不作为 Cargo example 编译；核心 wasm 平台门控独立保留。
 - [x] **Wine UI 按平台隐藏**：Windows 原生启动不经 wine，设置页 Wine 区块与主页 Wine 状态卡整体隐藏（此前“未检测到可用 wine”像故障）；macOS 隐藏 Linux 专属的 esync/fsync/gamemode 开关（msync/DXVK 保留）；隐藏开关的草稿值保存时原样写回 (resolved: 2026-09-12)
 - [x] **blitz 下拉弹层层级**：改为不依赖 `position:absolute + z-index` 的文档流内联展开（把下方内容顶开），原生 blitz 与 web 渲染一致，不再被后续卡片遮挡 (resolved: 2026-09-12)
 - [x] **下拉框交互缺陷**：展开状态收进全局 `AppState.open_dropdown`（同时只允许一个展开，切 Tab 自动收起）；点击弹层外区域收起走事件冒泡——根容器 onclick 收起、下拉容器 `stop_propagation` 阻断内部点击（全屏透明捕获层方案在 blitz 上会连弹层选项点击一并吞掉，已弃用） (resolved: 2026-09-12)
@@ -258,7 +269,7 @@
 - [x] **设置页长表单**：滚动改为页面自持——主页/登录页各自包滚动容器，设置页拆为「表单滚动区 + 固定保存栏」，保存按钮在任何滚动位置都可见可点（此前的 sticky 方案在 blitz 上不生效，已弃用） (resolved: 2026-09-12)
 - [x] **全角括号紧邻西文时渲染为方块**：根因是 blitz 无逐字符字体回退，默认拉丁字体缺全角标点字形；根容器显式指定中文字体栈（Microsoft YaHei / PingFang SC / Noto Sans CJK SC，覆盖三平台，web 端同样生效），「（插件）」「（release）」等混排均正常渲染 (resolved: 2026-09-12)
 - [x] **设置页交互形态**：更新通道从自由文本改为下拉框（稳定版 release / 测试版 staging，回显当前值，配置为自定义通道时自动补进选项）；另有默认值的输入项（安装目录/初始化延迟/默认大区）以常显说明文字标注默认与留空语义——blitz 未实现 placeholder 渲染，原生端不能依赖 placeholder 表达默认值 (resolved: 2026-09-12)
-- [x] **状态栏长错误不换行**：状态栏加 `overflow-wrap: anywhere` + `line-height: 1.5`，无空格长串（URL/路径/长错误）可断行，不再单行溢出窗口 (resolved: 2026-09-12)
+- [x] **底栏长日志与操作结果**：底栏日志单行省略、悬停看全文；操作结果使用独立可关闭的短提示，更新失败和登录/设置错误同时保留原位显示，不让长 URL/路径撑破窗口。产品级恢复提示仍见上方待办。
 - [x] **设置页开关在原生 blitz 下保存无效**：blitz 对 checkbox 点击只派发 input 事件（无 change），`onchange` 桌面端永不触发——勾选只是控件自身视觉切换、草稿 signal 不更新，保存实际写入旧值（实测启用 Dalamud 后 config.toml 仍为 `enabled = false`）；`Checkbox` 改用 `oninput`（web 端 checkbox 点击同样触发 input；dioxus-web 与 blitz 均把 value 归一为 "true"/"false"，`FormData::checked()` 两端可用） (resolved: 2026-09-12)
 - [x] **设置页补全剩余配置项**：新增「默认大区」（`AppConfig.area`，此前设置页无此输入框、保存时只能原样保留；GUI 启动拉取大区列表后默认选中该大区，CLI `launch` 未传 `--area` 时也用它）与 Dalamud「安装目录」（`install_root`，留空用默认 `~/.eorzea/dalamud`） (resolved: 2026-09-12)
 - [x] **设置页 Dalamud 项无说明**：加载方式/更新通道/安装目录/初始化延迟/插件禁用开关逐项补充说明文字（按注入器 `--mode`/`--without-dalamud`/`--no-plugin`/`--no-3rd-plugin`/`--dalamud-delay-initialize` 实际行为撰写）；「默认大区」下方动态列出可用大区 ID 对照（如 8=豆豆柴 · 1=陆行鸟） (resolved: 2026-09-12)
@@ -274,7 +285,7 @@
 - [x] **编译与单元测试**：Windows（MSVC）上 `cargo check --workspace --all-targets` 通过、`cargo test --workspace` 全绿（eorzea 核心库 / eorzea-app / eorzea-auth / eoz 全部通过，2026-10-30 复核）
 - [x] **Wine 模块按平台裁剪**：`src/wine.rs` 在 Windows 上不参与编译（`lib.rs` 的 `pub mod wine` 加 `cfg(not(windows))`）；Injector 启动/通信错误改用平台无关的 `dalamud::runner::InjectorError`（`WineError` 留在 wine 模块，原生 Windows 路径不再借用它）；`runner` 的 winepath/Injector-over-Wine 函数、`home` 的 Wine 状态卡、`wine_test` 示例均在 Windows 上不编译；`eoz launch --wine` 在 Windows 上不存在
 - [x] **原生启动分支**：`game.rs` 的 `cfg(target_os = "windows")` 分支直启 `ffxiv_dx11.exe`，或原生运行 `Dalamud.Injector.exe`（无 winepath / `XL_WINEON*` / `WINEPREFIX`）；Wine 设置区块与主页 Wine 状态卡在 UI 隐藏
-- [x] **GUI 启动冒烟**：`target/debug/eorzea.exe` 在 Windows 上保持运行、渲染后端为 wgpu/Vulkan（2026-10-30）
+- [ ] **Iced GUI Windows 构建与启动冒烟**：需验证 tiny-skia/softbuffer、中文字体、窗口行为；不能沿用其他 GUI 框架的构建/运行结论。
 - [ ] **真机端到端验证**：Windows 上实际登录 → 启动游戏 → Dalamud 注入尚未验证（与 C# `WindowsDalamudRunner` 的行为差异需实机确认）
 - [ ] **Windows 设备指纹**：见 P0-1（当前 fallback 为 `unknown-<USERNAME>`）
 - [ ] **发布版日志**：`windows_subsystem = "windows"` 后 GUI 无控制台，`tracing` 只写 stderr → release 版没有日志可查；需要文件日志（如滚动写到 `~/.eorzea/logs/`）

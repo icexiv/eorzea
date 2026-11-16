@@ -1,868 +1,441 @@
-//! 主页：账号/大区选择、状态仪表盘（游戏位置/版本、Dalamud、Wine）、检查/更新游戏、启动游戏。
-
-use dioxus::dioxus_core::spawn_forever;
-use dioxus::prelude::*;
-
-use crate::logging::LogLevel;
-#[cfg(not(target_os = "windows"))]
-use eorzea::config::WineStartupType;
-use eorzea::dalamud::{DalamudStatus, InstallState, updater};
-use eorzea::game_files::patch_manager::PatchPhase;
-use eorzea::game_files::{
-    CheckResult, GameFileManager, InstallPhase, UpdateProgress, default_patch_dir,
+use super::{App, Msg, backend, state::Operation, theme::*};
+use eorzea::{
+    dalamud::InstallState,
+    game_files::{InstallPhase, UpdateProgress, patch_manager::PatchPhase},
 };
-use eorzea::launcher::{LaunchEvent, LaunchRequest};
-#[cfg(not(target_os = "windows"))]
-use eorzea::wine::WineTool;
+use iced::widget::{button, column, container, progress_bar, row};
+use iced::{Element, Fill};
 
-use super::login::{ActionButton, ErrorRow, Section};
-use super::settings::Checkbox;
-use super::{AppState, Dropdown};
-
-/// 更新流程状态机。
-pub(crate) enum UpdateState {
-    Idle,
-    Checking,
-    UpToDate,
-    /// 有 N 个补丁待下载。
-    NeedsPatch(usize),
-    Running,
-    Done(String),
-    Failed(String),
-}
-
-impl UpdateState {
-    pub(super) fn is_busy(&self) -> bool {
-        matches!(self, UpdateState::Checking | UpdateState::Running)
-    }
-}
-
-#[component]
-pub fn HomePage() -> Element {
-    let mut state = use_context::<AppState>();
-    let t = (state.theme)();
-    let mut update_state = state.update_state;
-    let mut patches = state.update_patches;
-    // 全局信号：切到别的页面再回来，按钮仍保持「启动中…」。
-    let mut launching = state.launching;
-    // 「本次启动加载 Dalamud」的会话内覆盖，不写回 config.toml。
-    let dalamud_this_launch = use_signal(|| state.dalamud_cfg.read().enabled);
-
-    // Dalamud 状态为异步检测（release API + 本地安装 + 版本门控），避免在 render 里做网络/磁盘探测。
-    let mut dalamud_status = use_signal(|| None::<DalamudStatus>);
-    let mut dalamud_loading = use_signal(|| true);
-    use_hook(move || {
-        spawn(async move {
-            let game_root = state.game_path.read().clone();
-            let cfg = state.dalamud_cfg.read().clone();
-            if cfg.enabled {
-                if let Some(root) = game_root {
-                    let install_root = cfg
-                        .install_root
-                        .clone()
-                        .unwrap_or_else(updater::default_install_root);
-                    let client = reqwest::Client::new();
-                    let st = updater::status(&client, &install_root, &root, &cfg.track).await;
-                    dalamud_status.set(Some(st));
-                }
-            }
-            dalamud_loading.set(false);
-        });
-    });
-
-    let game_root = state.game_path.read().clone();
-    let installed_checkpoint = use_memo(move || {
-        state
-            .update_progress
-            .read()
-            .as_ref()
-            .map(|p| p.install.completed)
-            .unwrap_or(0)
-    });
-    // 本地版本（本地文件读取，随 game_path 变化重算）；只取展示用的 boot/game 版本
-    let versions = use_memo(move || {
-        let _ = installed_checkpoint();
-        state.game_path.read().clone().map(|p| {
-            let v = GameFileManager::new().status(&p);
-            (v.boot, v.ffxiv)
-        })
-    });
-
-    // ── 检查更新 ────────────────────────────────────────────────────────
-    let check_update = move |_: MouseEvent| {
-        if update_state.read().is_busy() {
-            state.status.set("更新任务进行中，请等待完成".into());
-            return;
-        }
-        if launching() {
-            return;
-        }
-        let Some(root) = game_root.clone() else {
-            state.status.set("请先设置游戏目录".into());
-            return;
-        };
-        update_state.set(UpdateState::Checking);
-        state.update_progress.set(None);
-        spawn_forever(async move {
-            let mgr = GameFileManager::new();
-            match mgr.pending_update(&root).await {
-                Ok(Some(pending)) => {
-                    let n = pending.patches.len();
-                    patches.set(pending.patches);
-                    update_state.set(UpdateState::NeedsPatch(n));
-                    state
-                        .status
-                        .set("发现未完成更新，点击更新游戏恢复原队列".into());
-                    return;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    update_state.set(UpdateState::Failed(e.to_string()));
-                    return;
-                }
-            }
-            let Some(area) = selected_area(&state) else {
-                update_state.set(UpdateState::Failed("请先选择大区".into()));
-                return;
-            };
-            match mgr.check_update(&area, &root, false, 5).await {
-                Ok(CheckResult::UpToDate { .. }) => {
-                    patches.set(Vec::new());
-                    update_state.set(UpdateState::UpToDate);
-                }
-                Ok(CheckResult::NeedsPatch { patches: list, .. }) => {
-                    let n = list.len();
-                    patches.set(list);
-                    update_state.set(UpdateState::NeedsPatch(n));
-                }
-                Ok(CheckResult::NeedsPatchBoot) => {
-                    update_state.set(UpdateState::Failed("boot 需要更新（暂不支持）".into()));
-                }
-                Err(e) => update_state.set(UpdateState::Failed(format!("{e}"))),
-            }
-        });
-    };
-
-    // ── 更新游戏（下载 + 安装）──────────────────────────────────────────
-    let run_update = move |_: MouseEvent| {
-        if update_state.read().is_busy() || launching() {
-            return;
-        }
-        let Some(root) = state.game_path.read().clone() else {
-            state.status.set("请先在设置页配置游戏目录".into());
-            return;
-        };
-        let list = patches.read().clone();
-        let download = state.download_cfg.read().clone();
-        if let Err(error) = download.validate() {
-            state
-                .status
-                .set(format!("下载配置无效: {error}，请在设置页修改"));
-            return;
-        }
-        let patch_dir = default_patch_dir(&root);
-        update_state.set(UpdateState::Running);
-        state.update_progress.set(None);
-        spawn_forever(async move {
-            let mgr = GameFileManager::new();
-            match mgr
-                .update_with_min_concurrency(
-                    &list,
-                    &patch_dir,
-                    &root,
-                    download.concurrency,
-                    download.min_concurrency,
-                    |progress| {
-                        state.update_progress.set(Some(progress));
-                    },
-                )
-                .await
-            {
-                Ok(summary) => {
-                    patches.set(Vec::new());
-                    update_state.set(UpdateState::Done(format!(
-                        "更新完成（应用并清理 {} 个补丁）",
-                        summary.installed.len(),
-                    )));
-                }
-                Err(e) => update_state.set(UpdateState::Failed(format!(
-                    "更新失败: {e}。队列已保留，重新检查更新可恢复。"
-                ))),
-            }
-        });
-    };
-
-    // ── 启动游戏 ────────────────────────────────────────────────────────
-    let launch_game = move |_: MouseEvent| {
-        if launching() {
-            return;
-        }
-        if update_state.read().is_busy() {
-            state.status.set("请先等待游戏更新完成".into());
-            return;
-        }
-        let Some(snda_id) = state.selected_account.read().clone() else {
-            state
-                .status
-                .set("请先选择账号（没有账号请到登录页登录）".into());
-            return;
-        };
-        let Some(area) = selected_area(&state) else {
-            state.status.set("请选择大区".into());
-            return;
-        };
-        let Some(root) = state.game_path.read().clone() else {
-            state.status.set("请先在设置页配置游戏目录".into());
-            return;
-        };
-        let exe = root.join("game/ffxiv_dx11.exe");
-        let Some(launcher) = state.launcher.read().clone() else {
-            state.status.set("启动器尚未初始化完成".into());
-            return;
-        };
-        launching.set(true);
-        // root scope：切换页面不会取消正在进行的启动流程。
-        spawn_forever(async move {
-            tracing::info!(
-                account = %snda_id,
-                area = %area.area_name,
-                exe = %exe.display(),
-                "开始启动游戏"
-            );
-            let areas = state.areas.read().clone();
-            let wine = state.settings.read().clone();
-            let auth_path = eorzea::auth::config_path();
-            let result = launcher
-                .launch_account(
-                    LaunchRequest {
-                        game_root: &root,
-                        auth_path: &auth_path,
-                        account: Some(&snda_id),
-                        area,
+impl App {
+    pub(super) fn home(&self) -> Element<'_, Msg> {
+        let enabled = !self.critical_busy() && !self.modal_open();
+        let accounts = self
+            .auth
+            .accounts
+            .iter()
+            .map(|a| (a.snda_id.clone(), a.display_name().to_string()))
+            .collect();
+        let areas = self
+            .areas
+            .iter()
+            .map(|a| (a.area_id.clone(), a.area_name.clone()))
+            .collect();
+        let mut launch = column![
+            row![
+                row![
+                    text("账号").size(13).color(MUTED),
+                    self.dropdown(
+                        "account",
+                        accounts,
+                        self.selected_account.as_deref(),
+                        "请选择账号",
+                        enabled
+                    )
+                ]
+                .spacing(12)
+                .width(Fill)
+                .align_y(iced::Alignment::Center),
+                row![
+                    text("大区").size(13).color(MUTED),
+                    self.dropdown(
+                        "area",
                         areas,
-                        wine: &wine,
-                        dalamud: Some(dalamud_this_launch()),
-                    },
-                    |event| match event {
-                        LaunchEvent::DalamudProgress(phase, done, total) => {
-                            let label = phase.label();
-                            if total > 0 {
-                                state.status.set(format!(
-                                    "正在准备 {label}… {} / {}",
-                                    human_bytes(done),
-                                    human_bytes(total)
-                                ));
-                            } else {
-                                state.status.set(format!("正在准备 {label}…"));
-                            }
-                        }
-                        LaunchEvent::LoggingIn { account_name } => {
-                            state.status.set(format!("正在自动登录 {account_name}…"));
-                        }
-                        LaunchEvent::SessionRefreshed { .. } => {
-                            state.auth_cfg.set(eorzea::auth::load(&auth_path));
-                            tracing::info!("自动登录成功，凭据已保存");
-                        }
-                        LaunchEvent::Starting { .. } => {
-                            state.status.set("正在启动游戏…".into());
-                        }
-                    },
-                )
-                .await;
-            match result {
-                Ok(result) => {
-                    state
-                        .status
-                        .set(format!("游戏已启动（PID {}）", result.child.id()));
-                    tracing::info!(pid = result.child.id(), "游戏进程已启动");
-                }
-                Err(e) => {
-                    let hint = match &e {
-                        eorzea::launcher::LauncherError::DalamudNotReady(_) => {
-                            "（可关闭主页的「本次启动加载 Dalamud」后重试）"
-                        }
-                        eorzea::launcher::LauncherError::Auth(_) => {
-                            "（凭据失效时请到账号管理重新登录）"
-                        }
-                        _ => "",
-                    };
-                    state.status.set(format!("启动失败: {e}{hint}"));
-                    tracing::error!(error = %e, "游戏启动失败");
-                }
+                        self.selected_area.as_deref(),
+                        if self.area_loading {
+                            "大区列表加载中…"
+                        } else {
+                            "请选择大区"
+                        },
+                        enabled
+                    )
+                ]
+                .spacing(12)
+                .width(Fill)
+                .align_y(iced::Alignment::Center)
+            ]
+            .spacing(16)
+            .align_y(iced::Alignment::Start)
+        ]
+        .spacing(8);
+        if let Some(error) = &self.area_error {
+            launch = launch.push(text(error).size(12).color(RED)).push(btn(
+                "重新获取大区",
+                (!self.area_loading).then_some(Msg::RetryAreas),
+                false,
+            ));
+        }
+        let mut body = column![section("启动设置", launch)].spacing(12);
+        let cards = self.cards();
+        for pair in cards.chunks(2) {
+            let mut stats = row![].spacing(12);
+            for (title, main, detail, color) in pair {
+                stats = stats.push(
+                    container(
+                        column![
+                            text(*title).size(12).color(MUTED),
+                            text(main.clone()).size(14).color(*color),
+                            text(detail.clone()).size(12).color(MUTED)
+                        ]
+                        .spacing(4),
+                    )
+                    .padding(12)
+                    .width(Fill)
+                    .style(summary),
+                );
             }
-            launching.set(false);
-        });
-    };
-
-    let accounts = state.auth_cfg.read().accounts.clone();
-    let account_items: Vec<(String, String)> = accounts
-        .iter()
-        .map(|a| (a.snda_id.clone(), a.display_name().to_string()))
-        .collect();
-    let area_items: Vec<(String, String)> = state
-        .areas
-        .read()
-        .iter()
-        .map(|a| (a.area_id.clone(), a.area_name.clone()))
-        .collect();
-    let area_placeholder: &'static str = if state.areas.read().is_empty() {
-        "大区列表加载中…"
-    } else {
-        "请选择大区"
-    };
-
-    // ── 状态卡片数据 ─────────────────────────────────────────────────────
-    let status_game_root = state.game_path.read().clone();
-    let game_exe_ok = status_game_root
-        .as_ref()
-        .map(|r| r.join("game/ffxiv_dx11.exe").is_file())
-        .unwrap_or(false);
-
-    let dalamud_cfg = state.dalamud_cfg.read().clone();
-    let (dalamud_main, dalamud_sub, dalamud_color) = if !dalamud_cfg.enabled {
-        (
-            "未启用".to_string(),
-            "可在设置页启用（默认关闭，opt-in）".to_string(),
-            t.text_secondary,
-        )
-    } else if dalamud_loading() {
-        (
-            "检查中…".to_string(),
-            "正在获取 release 信息并核对游戏版本".to_string(),
-            t.text_secondary,
-        )
-    } else {
-        match dalamud_status.read().as_ref() {
-            Some(st) => match &st.install_state {
+            body = body.push(stats);
+        }
+        let mut update = column![
+            row![
+                btn(
+                    if matches!(self.operation, Operation::Checking | Operation::Updating) {
+                        "更新任务进行中…"
+                    } else {
+                        "检查更新"
+                    },
+                    enabled.then_some(Msg::Check),
+                    true
+                ),
+                btn(
+                    "更新游戏",
+                    (enabled && !self.patches.is_empty()).then_some(Msg::Update),
+                    true
+                )
+            ]
+            .spacing(8)
+        ]
+        .spacing(12);
+        if !self.update_message.is_empty() {
+            update = update.push(
+                text(&self.update_message)
+                    .size(13)
+                    .color(if self.update_error { RED } else { MUTED }),
+            );
+        }
+        if let Some(progress) = &self.update_progress {
+            update = update.push(progress_panel(progress));
+        }
+        body.push(section("游戏更新", update))
+            .push(check(
+                "本次启动加载 Dalamud（插件）",
+                self.dalamud_this_launch,
+                "load",
+                enabled,
+            ))
+            .push(launch_button(
+                if self.operation == Operation::Launching {
+                    "启动中…"
+                } else {
+                    "启动游戏"
+                },
+                enabled && self.launcher.is_some(),
+            ))
+            .push(if self.operation == Operation::Launching {
+                text(&self.status).size(13).color(MUTED)
+            } else {
+                text("").size(1)
+            })
+            .into()
+    }
+    fn cards(&self) -> Vec<(&'static str, String, String, iced::Color)> {
+        let mut cards = vec![
+            (
+                "游戏位置",
+                self.config
+                    .game_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "未配置".into()),
+                if self.config.game_path.is_none() {
+                    "请到设置页选择游戏根目录。".into()
+                } else if self.local.found {
+                    "已找到 game/ffxiv_dx11.exe".into()
+                } else {
+                    "未找到 game/ffxiv_dx11.exe".into()
+                },
+                if self.local.found { GREEN } else { WARNING },
+            ),
+            (
+                "游戏版本",
+                self.local
+                    .versions
+                    .as_ref()
+                    .map(|(_, game)| format!("game: {game}"))
+                    .unwrap_or_else(|| "未配置".into()),
+                self.local
+                    .versions
+                    .as_ref()
+                    .map(|(boot, _)| format!("boot: {boot}"))
+                    .unwrap_or_default(),
+                INK,
+            ),
+        ];
+        let (main, detail, color) = if !self.dalamud_this_launch {
+            (
+                "本次不加载".into(),
+                "可用主页开关覆盖已保存配置。".into(),
+                MUTED,
+            )
+        } else if self.dalamud_loading {
+            ("检查中…".into(), "正在核对本地安装与游戏版本".into(), MUTED)
+        } else if let Some(status) = &self.dalamud {
+            match &status.install_state {
                 InstallState::Ready => (
                     format!(
                         "已安装 {}",
-                        st.local_assembly_version.as_deref().unwrap_or("未知版本")
+                        status
+                            .local_assembly_version
+                            .as_deref()
+                            .unwrap_or("未知版本")
                     ),
-                    if st.remote_from_cache {
-                        format!(
-                            "版本匹配（{}），启动时加载；远端元数据不可用，按本地记录判定",
-                            st.local_game_ver
-                        )
+                    if status.remote_from_cache {
+                        "版本匹配 · 使用本地元数据缓存".into()
                     } else {
-                        format!("版本匹配（{}），启动时加载", st.local_game_ver)
+                        "版本匹配，启动时加载".into()
                     },
-                    t.success,
+                    GREEN,
                 ),
-                InstallState::Missing => (
-                    "未安装".to_string(),
-                    match st.remote.as_ref() {
-                        Some(r) => format!("启动时自动安装 release {}", r.assembly_version),
-                        None => "release 元数据不可用，需要联网才能安装".to_string(),
-                    },
-                    t.warning,
-                ),
+                InstallState::Missing => {
+                    ("未安装".into(), "启动时自动准备 release".into(), WARNING)
+                }
                 InstallState::OutOfDate => (
-                    "需要更新".to_string(),
-                    format!(
-                        "已安装 {}，与本地游戏版本 {} 不匹配",
-                        st.local_assembly_version.as_deref().unwrap_or("未知版本"),
-                        st.local_game_ver
-                    ),
-                    t.warning,
+                    "需要更新".into(),
+                    format!("本地游戏版本 {}", status.local_game_ver),
+                    WARNING,
                 ),
                 InstallState::Unsupported => (
-                    "暂不兼容".to_string(),
-                    format!(
-                        "release {} 仅支持 {}，本地游戏 {}",
-                        st.remote
-                            .as_ref()
-                            .map(|r| r.assembly_version.as_str())
-                            .unwrap_or("?"),
-                        st.remote
-                            .as_ref()
-                            .map(|r| r.supported_game_ver.as_str())
-                            .unwrap_or("?"),
-                        st.local_game_ver
-                    ),
-                    t.danger,
+                    "暂不兼容".into(),
+                    format!("release 尚未支持游戏版本 {}", status.local_game_ver),
+                    RED,
                 ),
                 InstallState::RuntimeMissing => (
-                    "缺少 .NET Runtime".to_string(),
-                    "启动时将自动下载 Windows x64 .NET runtime".to_string(),
-                    t.warning,
+                    "缺少 .NET Runtime".into(),
+                    "启动时自动准备 Windows x64 runtime".into(),
+                    WARNING,
                 ),
-                InstallState::AssetsMissing => (
-                    "缺少 Assets".to_string(),
-                    "启动时将自动下载 Dalamud assets".to_string(),
-                    t.warning,
-                ),
-                InstallState::Failed(msg) => ("安装异常".to_string(), msg.clone(), t.danger),
-            },
-            None => (
-                "无法获取状态".to_string(),
-                "release 信息不可用，启动时将报错（可关闭本次加载开关）".to_string(),
-                t.warning,
+                InstallState::AssetsMissing => {
+                    ("缺少 Assets".into(), "启动时自动准备资源".into(), WARNING)
+                }
+                InstallState::Failed(error) => ("安装异常".into(), error.clone(), RED),
+            }
+        } else {
+            (
+                "无法获取状态".into(),
+                "启动时重新检查；准备失败不会启动游戏。".into(),
+                WARNING,
+            )
+        };
+        cards.push(("Dalamud", main, detail, color));
+        #[cfg(not(target_os = "windows"))]
+        cards.push((
+            "Wine",
+            format!(
+                "启动方式：{}",
+                match self.config.settings.startup_type {
+                    eorzea::config::WineStartupType::Auto => "自动",
+                    eorzea::config::WineStartupType::Managed => "托管",
+                    eorzea::config::WineStartupType::Custom => "自定义",
+                    eorzea::config::WineStartupType::System => "系统",
+                }
             ),
+            self.local.wine.clone(),
+            INK,
+        ));
+        cards
+    }
+    pub(super) fn begin_operation(&mut self, operation: Operation) -> Option<u64> {
+        if self.critical_busy() {
+            self.status = "请等待当前任务完成".into();
+            return None;
         }
-    };
-
-    // Wine 状态卡仅在依赖 wine 的平台展示：Windows 原生启动忽略 wine 参数，
-    // 展示"未检测到可用 wine"会被误读为故障。
-    #[cfg(not(target_os = "windows"))]
-    let wine_card = {
-        // 探测会读文件系统/扫描 PATH 并写日志，必须 memo 化：否则日志区每次
-        // 刷新触发的重渲染都会再次探测，日志 → 重渲染 → 日志形成死循环。
-        let (wine_startup, wine_sub) = use_memo(move || {
-            let wine_cfg = state.settings.read().clone();
-            let wine_startup = match wine_cfg.startup_type {
-                WineStartupType::Auto => "自动",
-                WineStartupType::Managed => "托管",
-                WineStartupType::Custom => "自定义",
-                WineStartupType::System => "系统",
-            }
-            .to_string();
-            // detect 只做本地探测（自定义路径 → 托管目录 → PATH），不会触发下载
-            let wine_tool = WineTool::detect(wine_cfg.custom_path.as_deref());
-            let wine_sub = match &wine_tool {
-                Some(w) if w.is_managed => format!("{}（托管）", w.wine64_path.display()),
-                Some(w) => format!("{}", w.wine64_path.display()),
-                None => "未检测到可用 wine".to_string(),
-            };
-            (wine_startup, wine_sub)
-        })();
-        rsx! {
-            StatusCard { title: "Wine", badge: Some("Linux / macOS"),
-                p { style: "margin: 0; font-size: 13px; color: {t.text};", "启动方式：{wine_startup}" }
-                p { style: "margin: 4px 0 0 0; font-size: 12px; color: {t.text_secondary}; overflow-wrap: anywhere;", "{wine_sub}" }
-            }
+        self.operation_generation += 1;
+        self.operation = operation;
+        Some(self.operation_generation)
+    }
+    pub(super) fn check_update(&mut self) {
+        let Some(root) = self.config.game_path.clone() else {
+            self.status = "请先在设置页配置游戏目录".into();
+            return;
+        };
+        let Some(generation) = self.begin_operation(Operation::Checking) else {
+            return;
+        };
+        self.update_message = "正在检查更新…".into();
+        self.update_error = false;
+        self.update_progress = None;
+        self.patches.clear();
+        backend::check(
+            &self.runtime,
+            self.bus.clone(),
+            generation,
+            root,
+            self.selected_area(),
+        );
+    }
+    pub(super) fn run_update(&mut self) {
+        let Some(root) = self.config.game_path.clone() else {
+            return;
+        };
+        if self.patches.is_empty() {
+            return;
         }
-    };
-    #[cfg(target_os = "windows")]
-    let wine_card = rsx! {};
-
-    let update_is_busy = update_state.read().is_busy();
-    let launch_button_bg = if launching() {
-        t.active_bg
-    } else {
-        t.primary_bg
-    };
-    let launch_button_fg = if launching() {
-        t.text_secondary
-    } else {
-        t.primary_fg
-    };
-    let launch_button_cursor = if launching() { "default" } else { "pointer" };
-
-    // 运行日志：最新在最上方（blitz 无法程序化滚动到末尾）。
-    // 先克隆出渲染所需的行并释放读锁，避免与轮询任务的写锁重叠。
-    let log_rows: Vec<(String, &'static str)> = {
-        let entries = state.logs.read();
-        entries
-            .iter()
-            .rev()
-            .map(|entry| {
-                let color = match entry.level {
-                    LogLevel::Info => t.text_secondary,
-                    LogLevel::Warn => t.warning,
-                    LogLevel::Error => t.danger,
-                };
-                (entry.text.clone(), color)
-            })
-            .collect()
-    };
-
-    rsx! {
-        div {
-            // 页面自持滚动（外层不滚，设置页的保存栏才能固定在滚动区外）
-            style: "flex: 1; min-height: 0; overflow-y: auto; padding: 24px 28px;",
-            div {
-                style: "display: flex; flex-direction: column; gap: 16px;",
-
-            // ── 启动设置（紧凑单行）─────────────────────────────────────
-            Section { title: "启动设置",
-                div {
-                    // flex-start：下拉内联展开撑高行时，标签保持与按钮同顶对齐
-                    style: "display: flex; flex-direction: row; align-items: flex-start; gap: 12px; flex-wrap: wrap;",
-                    div { style: "font-size: 14px; color: {t.text_secondary}; padding: 8px 0;", "账号" }
-                    div {
-                        style: "width: 220px;",
-                        Dropdown {
-                            id: "home-account",
-                            items: account_items,
-                            selected: state.selected_account,
-                            placeholder: "请选择账号",
-                            // 切换账号时应用该账号的默认大区（名称，兼容旧 ID）；
-                            // 账号未设置时保留当前选择
-                            onchange: move |id: String| {
-                                let area = state
-                                    .auth_cfg
-                                    .read()
-                                    .find(&id)
-                                    .and_then(|a| a.area.clone());
-                                let Some(area) = area else { return };
-                                let area_id = state
-                                    .areas
-                                    .read()
-                                    .iter()
-                                    .find(|a| a.area_name == area || a.area_id == area)
-                                    .map(|a| a.area_id.clone());
-                                if let Some(area_id) = area_id {
-                                    state.selected_area.set(Some(area_id));
-                                }
-                            },
-                        }
-                    }
-                    div { style: "font-size: 14px; color: {t.text_secondary}; padding: 8px 0;", "大区" }
-                    div {
-                        style: "width: 220px;",
-                        Dropdown {
-                            id: "home-area",
-                            items: area_items,
-                            selected: state.selected_area,
-                            placeholder: area_placeholder,
-                            // 主页的大区选择即当前账号的默认大区，改动立即写回 auth.toml；
-                            // 存名称而不是数字 ID
-                            onchange: move |id: String| {
-                                let Some(account_id) = state.selected_account.read().clone() else {
-                                    return;
-                                };
-                                let area_name = state
-                                    .areas
-                                    .read()
-                                    .iter()
-                                    .find(|a| a.area_id == id)
-                                    .map(|a| a.area_name.clone());
-                                let Some(area_name) = area_name else { return };
-                                let mut cfg = eorzea::auth::load(&eorzea::auth::config_path());
-                                let changed = match cfg
-                                    .accounts
-                                    .iter_mut()
-                                    .find(|a| a.snda_id == account_id)
-                                {
-                                    Some(acc) => {
-                                        if acc.area.as_deref() == Some(area_name.as_str()) {
-                                            false
-                                        } else {
-                                            acc.area = Some(area_name);
-                                            true
-                                        }
-                                    }
-                                    None => false,
-                                };
-                                if !changed {
-                                    return;
-                                }
-                                match eorzea::auth::save(
-                                    &eorzea::auth::config_path(),
-                                    &cfg,
-                                ) {
-                                    Ok(()) => {
-                                        state.auth_cfg.set(cfg);
-                                        state.status.set("默认大区已保存".into());
-                                    }
-                                    Err(e) => {
-                                        state.status.set(format!("保存账号配置失败: {e}"))
-                                    }
-                                }
-                            },
-                        }
-                    }
-                }
-            }
-
-            // ── 状态仪表盘（2×2，窄窗口自动换行）────────────────────────
-            div {
-                style: "display: flex; flex-direction: row; gap: 12px; flex-wrap: wrap;",
-                StatusCard { title: "游戏位置",
-                    if let Some(root) = &status_game_root {
-                        p { style: "margin: 0; font-size: 13px; color: {t.text}; overflow-wrap: anywhere;", "{root.display()}" }
-                        if game_exe_ok {
-                            p { style: "margin: 4px 0 0 0; font-size: 12px; color: {t.success};", "✓ 已找到 game/ffxiv_dx11.exe" }
-                        } else {
-                            p { style: "margin: 4px 0 0 0; font-size: 12px; color: {t.danger};", "✗ 未找到 game/ffxiv_dx11.exe" }
-                        }
-                    } else {
-                        p { style: "margin: 0; font-size: 13px; color: {t.text_secondary};", "未配置，请到设置页选择游戏根目录。" }
-                    }
-                }
-                StatusCard { title: "游戏版本",
-                    if let Some(v) = versions.read().as_ref() {
-                        p { style: "margin: 0; font-size: 13px; color: {t.text};", "game: {v.1}" }
-                        p { style: "margin: 4px 0 0 0; font-size: 12px; color: {t.text_secondary};", "boot: {v.0}" }
-                    } else {
-                        p { style: "margin: 0; font-size: 13px; color: {t.text_secondary};", "未配置" }
-                    }
-                }
-            }
-            div {
-                style: "display: flex; flex-direction: row; gap: 12px; flex-wrap: wrap;",
-                StatusCard { title: "Dalamud",
-                    p { style: "margin: 0; font-size: 13px; color: {dalamud_color};", "{dalamud_main}" }
-                    p { style: "margin: 4px 0 0 0; font-size: 12px; color: {t.text_secondary}; overflow-wrap: anywhere;", "{dalamud_sub}" }
-                }
-                {wine_card}
-            }
-
-            // ── 游戏更新 ────────────────────────────────────────────────
-            Section { title: "游戏更新",
-                div {
-                    style: "display: flex; flex-direction: row; gap: 8px; align-items: center;",
-                    ActionButton {
-                        label: if update_is_busy { "更新任务进行中…".to_string() } else { "检查更新".to_string() },
-                        onclick: check_update,
-                    }
-                    if matches!(&*update_state.read(), UpdateState::NeedsPatch(_)) {
-                        ActionButton { label: "更新游戏", onclick: run_update }
-                    }
-                }
-
-                match &*update_state.read() {
-                    UpdateState::Idle => rsx! {},
-                    UpdateState::Checking => rsx! { p { style: "color: {t.text_secondary}; font-size: 13px;", "正在检查更新…" } },
-                    UpdateState::UpToDate => rsx! { p { style: "color: {t.success}; font-size: 13px;", "游戏已是最新。" } },
-                    UpdateState::NeedsPatch(n) => rsx! {
-                        p { style: "color: {t.warning}; font-size: 13px;", "发现 {n} 个补丁，点击「更新游戏」开始下载。" }
-                    },
-                    UpdateState::Running => rsx! {},
-                    UpdateState::Done(msg) => rsx! { p { style: "color: {t.success}; font-size: 13px;", "{msg}" } },
-                    UpdateState::Failed(e) => rsx! { ErrorRow { message: "{e}" } },
-                }
-                if let Some(progress) = state.update_progress.read().as_ref() {
-                    UpdateProgressPanel { progress: progress.clone() }
-                }
-            }
-
-            // ── 启动游戏 ────────────────────────────────────────────────
-                div {
-                    style: "display: flex; flex-direction: column; gap: 12px;",
-                    Checkbox { label: "本次启动加载 Dalamud（插件）", checked: dalamud_this_launch }
-                    button {
-                        style: "padding: 16px; border: none; border-radius: 8px; background: {launch_button_bg}; color: {launch_button_fg}; font-size: 18px; font-weight: 600; cursor: {launch_button_cursor};",
-                        onclick: launch_game,
-                        if launching() { "启动中…" } else { "启动游戏" }
-                    }
-                }
-
-            // ── 运行日志 ────────────────────────────────────────────────
-            Section { title: "运行日志（最新在上）",
-                div {
-                    // 不指定等宽字体：blitz 缺少逐字符回退，日志里的中文需要
-                    // 继承根节点的 CJK 字体栈，否则会渲染成方块。
-                    style: "height: 200px; overflow-y: auto; background: {t.page_bg}; border: 1px solid {t.border}; border-radius: 6px; padding: 8px 12px; font-size: 12px; line-height: 1.6;",
-                    if log_rows.is_empty() {
-                        p { style: "margin: 0; color: {t.text_secondary}; font-size: 12px;", "暂无日志" }
-                    } else {
-                        for (text , color) in log_rows.iter() {
-                            div {
-                                style: "white-space: pre-wrap; overflow-wrap: anywhere; color: {color};",
-                                "{text}"
-                            }
-                        }
-                    }
-                }
-            }
-            }
+        if let Err(e) = self.config.download.validate() {
+            self.status = format!("下载配置无效: {e}");
+            return;
         }
+        let Some(generation) = self.begin_operation(Operation::Updating) else {
+            return;
+        };
+        self.update_message = "正在更新游戏…".into();
+        self.update_error = false;
+        self.update_progress = None;
+        backend::update(
+            &self.runtime,
+            self.bus.clone(),
+            generation,
+            root,
+            self.patches.clone(),
+            self.config.download.clone(),
+        );
+    }
+    pub(super) fn launch_game(&mut self) {
+        let Some(account) = self.selected_account.clone() else {
+            self.status = "请先选择账号；没有账号请到账号管理添加".into();
+            return;
+        };
+        let Some(area) = self.selected_area() else {
+            self.status = "请选择大区".into();
+            return;
+        };
+        let Some(root) = self.config.game_path.clone() else {
+            self.status = "请先在设置页配置游戏目录".into();
+            return;
+        };
+        let Some(launcher) = self.launcher.clone() else {
+            self.status = "启动器尚未初始化完成".into();
+            return;
+        };
+        let Some(generation) = self.begin_operation(Operation::Launching) else {
+            return;
+        };
+        self.status = "正在准备启动…".into();
+        #[cfg(not(target_os = "windows"))]
+        let wine = self.config.settings.clone();
+        #[cfg(target_os = "windows")]
+        let wine = Default::default();
+        backend::launch(
+            &self.runtime,
+            self.bus.clone(),
+            generation,
+            launcher,
+            backend::Launch {
+                root,
+                account,
+                area,
+                areas: self.areas.clone(),
+                wine,
+                dalamud: self.dalamud_this_launch,
+            },
+        );
     }
 }
-
-#[component]
-fn ProgressRow(label: String, done: u64, total: u64, #[props(default)] secondary: bool) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    let pct = if total > 0 {
-        (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+pub(super) fn launch_button(label: &str, enabled: bool) -> Element<'_, Msg> {
+    super::motion::press(
+        button(
+            container(text(label).size(18))
+                .center_x(Fill)
+                .center_y(Fill),
+        )
+        .padding(0)
+        .height(56)
+        .width(Fill)
+        .on_press_maybe(enabled.then_some(Msg::Launch))
+        .style(primary),
+        enabled,
+    )
+}
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / (1024. * 1024. * 1024.))
     } else {
-        0.0
-    };
-    let color = if secondary { t.text_secondary } else { t.text };
-    let height = if secondary { 3 } else { 5 };
-    rsx! {
-        div { style: "margin-top: 10px;",
-            p { style: "margin: 0 0 6px; color: {color}; font-size: 12px; overflow-wrap: anywhere;",
-                "{label} · {human_bytes(done)} / {human_bytes(total)} · {pct:.1}%"
-            }
-            div { style: "height: {height}px; background: {t.progress_track}; border-radius: 2px; overflow: hidden;",
-                div { style: "height: 100%; width: {pct}%; background: {t.primary_bg};" }
-            }
-        }
+        format!("{:.1} MiB", bytes as f64 / (1024. * 1024.))
     }
 }
-
-#[component]
-fn UpdateProgressPanel(progress: UpdateProgress) -> Element {
-    let t = (use_context::<AppState>().theme)();
+pub(super) fn progress_rows(progress: &UpdateProgress) -> Vec<(String, u64, u64)> {
     let install = &progress.install;
     let download = &progress.download;
-    rsx! {
-        div { style: "display: flex; flex-direction: column; gap: 14px; margin-top: 8px;",
-            div { style: "padding: 0 0 12px; border-bottom: 1px solid {t.border};",
-                ProgressRow {
-                    label: format!("补丁应用（{} / {}）", install.completed, install.total_patches),
-                    done: install.done, total: install.total,
+    let mut rows = vec![(
+        format!(
+            "补丁应用（{} / {}）",
+            install.completed, install.total_patches
+        ),
+        install.done,
+        install.total,
+    )];
+    if let Some(current) = &install.current {
+        rows.push((
+            format!(
+                "#{} {} · {}",
+                current.index + 1,
+                current.version,
+                match current.phase {
+                    InstallPhase::Verifying => "校验中",
+                    InstallPhase::Applying => "应用中",
+                    InstallPhase::Committing => "提交 / 清理中",
                 }
-                if let Some(current) = &install.current {
-                    ProgressRow {
-                        label: format!("#{} {} · {}", current.index + 1, current.version, match current.phase {
-                            InstallPhase::Verifying => "校验中",
-                            InstallPhase::Applying => "应用中",
-                            InstallPhase::Committing => "提交 / 清理中",
-                        }),
-                        done: current.done, total: current.total, secondary: true,
-                    }
-                } else if progress.waiting_for_download {
-                    p { style: "margin: 8px 0 0; font-size: 12px; color: {t.text_secondary};", "等待队头补丁下载和校验完成…" }
-                }
-            }
-            div {
-                ProgressRow { label: "补丁下载", done: download.done, total: download.total }
-                for file in &download.active {
-                    ProgressRow {
-                        key: "{file.index}",
-                        label: format!("#{} {} · {}", file.index + 1, file.version, match file.phase {
-                            PatchPhase::Downloading => "下载中",
-                            PatchPhase::Verifying => "校验中",
-                        }),
-                        done: file.done, total: file.total, secondary: true,
-                    }
-                }
-            }
-        }
+            ),
+            current.done,
+            current.total,
+        ));
+    } else if progress.waiting_for_download {
+        rows.push(("等待队头补丁下载和校验完成…".into(), 0, 0));
     }
-}
-
-/// 当前选中大区的完整 `SdoArea`。
-fn selected_area(state: &AppState) -> Option<eorzea_auth::SdoArea> {
-    let id = state.selected_area.read().clone()?;
-    state.areas.read().iter().find(|a| a.area_id == id).cloned()
-}
-
-/// 状态仪表盘小卡片（标题 + 内容，等宽弹性布局）。
-#[component]
-fn StatusCard(
-    title: &'static str,
-    /// 标题右侧的平台提示（如「Linux / macOS」），None 不显示。
-    #[props(default)]
-    badge: Option<&'static str>,
-    children: Element,
-) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    rsx! {
-        div {
-            style: "flex: 1; min-width: 180px; background: {t.card_bg}; border: 1px solid {t.border}; border-radius: 8px; padding: 12px 16px;",
-            // 同 Section：不用 flex 横排标题和标签，避免 blitz 把文本项按
-            // min-content 换行并算错容器高度。
-            div {
-                style: "margin-bottom: 6px;",
-                p { style: "margin: 0; font-size: 12px; color: {t.text_secondary};", "{title}" }
-                if let Some(badge) = badge {
-                    div {
-                        style: "display: inline-block; margin-top: 4px; padding: 0 7px; border: 1px solid {t.border}; border-radius: 999px; background: {t.active_bg}; color: {t.text_secondary}; font-size: 10px; line-height: 16px; white-space: nowrap;",
-                        "{badge}"
-                    }
+    rows.push(("补丁下载".into(), download.done, download.total));
+    for file in &download.active {
+        rows.push((
+            format!(
+                "#{} {} · {}",
+                file.index + 1,
+                file.version,
+                match file.phase {
+                    PatchPhase::Downloading => "下载中",
+                    PatchPhase::Verifying => "校验中",
                 }
-            }
-            {children}
-        }
+            ),
+            file.done,
+            file.total,
+        ));
     }
-}
-
-/// 把字节数格式化为可读的 MiB/GiB。
-fn human_bytes(bytes: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    if bytes as f64 >= GIB {
-        format!("{:.2} GiB", bytes as f64 / GIB)
-    } else {
-        format!("{:.1} MiB", bytes as f64 / MIB)
+    for file in &progress.ready {
+        rows.push((format!("✓ 等待应用：{}", file.version), 0, 0));
     }
+    rows
 }
-
-#[cfg(test)]
-mod tests {
-    use super::super::{Tab, Theme};
-    use super::*;
-    use eorzea::game_files::patch_manager::{DownloadProgress, PatchProgress};
-    use eorzea::game_files::{InstallPatchProgress, InstallProgress};
-
-    fn progress_fixture() -> Element {
-        // 仅渲染进度组件：不读真实配置、不初始化认证、不发网络请求。
-        let state = AppState {
-            tab: use_signal(|| Tab::Home),
-            auth_cfg: use_signal(Default::default),
-            settings: use_signal(Default::default),
-            game_path: use_signal(|| None),
-            dalamud_cfg: use_signal(Default::default),
-            download_cfg: use_signal(Default::default),
-            areas: use_signal(Vec::new),
-            selected_account: use_signal(|| None),
-            selected_area: use_signal(|| None),
-            status: use_signal(String::new),
-            launching: use_signal(|| false),
-            update_state: use_signal(|| UpdateState::Running),
-            update_patches: use_signal(Vec::new),
-            update_progress: use_signal(|| None),
-            logs: use_signal(Vec::new),
-            open_dropdown: use_signal(|| None),
-            adding_account: use_signal(|| false),
-            launcher: use_signal(|| None),
-            theme: use_signal(Theme::light),
+fn progress_panel(progress: &UpdateProgress) -> Element<'_, Msg> {
+    let mut body = column![].spacing(6);
+    for (label, done, total) in progress_rows(progress) {
+        let fraction = if total > 0 {
+            (done as f64 / total as f64).clamp(0., 1.) as f32
+        } else {
+            0.
         };
-        use_context_provider(|| state);
-        let progress = UpdateProgress {
-            ready: Vec::new(),
-            install: InstallProgress {
-                done: 150,
-                total: 400,
-                completed: 1,
-                total_patches: 4,
-                current: Some(InstallPatchProgress {
-                    index: 1,
-                    version: "install-version".into(),
-                    phase: InstallPhase::Applying,
-                    done: 50,
-                    total: 100,
-                }),
-            },
-            download: DownloadProgress {
-                done: 300,
-                total: 400,
-                completed: 2,
-                skipped: 0,
-                active: vec![
-                    PatchProgress {
-                        index: 2,
-                        version: "download-version".into(),
-                        url: String::new(),
-                        done: 50,
-                        total: 100,
-                        resumed_from: 0,
-                        phase: PatchPhase::Downloading,
-                    },
-                    PatchProgress {
-                        index: 3,
-                        version: "verify-version".into(),
-                        url: String::new(),
-                        done: 50,
-                        total: 100,
-                        resumed_from: 0,
-                        phase: PatchPhase::Verifying,
-                    },
-                ],
-            },
-            waiting_for_download: false,
-        };
-        rsx! { UpdateProgressPanel { progress } }
-    }
-
-    #[test]
-    fn renders_application_and_parallel_download_progress_together() {
-        let mut dom = VirtualDom::new(progress_fixture);
-        let mutations = format!("{:?}", dom.rebuild_to_vec());
-        for text in [
-            "补丁应用",
-            "补丁下载",
-            "install-version",
-            "download-version",
-            "verify-version",
-            "校验中",
-        ] {
-            assert!(mutations.contains(text), "missing {text}: {mutations}");
+        body = body.push(
+            text(if total > 0 {
+                format!(
+                    "{label} · {} / {} · {:.1}%",
+                    human_bytes(done),
+                    human_bytes(total),
+                    fraction * 100.
+                )
+            } else {
+                label
+            })
+            .size(12)
+            .color(MUTED),
+        );
+        if total > 0 {
+            body = body.push(progress_bar(0.0..=1.0, fraction).girth(4));
         }
     }
+    body.into()
 }

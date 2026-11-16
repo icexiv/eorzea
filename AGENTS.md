@@ -2,28 +2,35 @@
 
 ## Project Overview
 
-`eorzea` is a Rust reimplementation of the FFXIV launcher, porting auth and game-launch logic from `XIVLauncher.Core` (C#). The project uses a dioxus-native + Rust workspace:
+`eorzea` is a Rust reimplementation of the FFXIV launcher, porting auth and game-launch logic from `XIVLauncher.Core` (C#). The project uses an Iced + tiny-skia Rust workspace:
 
 ```
 eorzea/                     # workspace root（核心库 crate `eorzea`，不含 GUI）
 ├── src/                    # auth / config / launcher / game / wine / dalamud / game_files
 ├── packages/
-│   ├── eorzea-app/         # GUI（bin `eorzea-app`，dioxus-native）
+│   ├── eorzea-app/         # GUI（bin `eorzea-app`，Iced + tiny-skia 软件渲染）
 │   │   └── src/ui/         # GUI 页面（mod.rs 根组件/共享状态，login/home/settings）
 │   ├── eorzea-auth/        # auth library (feature-gated)
 │   └── eorzea-cli/         # CLI（bin `eoz`：游戏文件管理/账号/启动）
 └── examples/               # sdo_launch / wine_test / hash_bench（核心库示例）
 ```
 
-工作区默认成员是 `eorzea-cli`：`cargo run` / `cargo check` 只编译 CLI 链路，不碰 dioxus/blitz；
-GUI 用 `cargo run -p eorzea-app`（wasm 预览在该 crate 目录下 `dx serve --platform web`）。
+工作区默认成员是 `eorzea-cli`：`cargo run` / `cargo check` 只编译 CLI 链路，不碰 GUI；
+GUI 用 `cargo run -p eorzea-app`，Iced 关闭默认 features，仅用 tiny-skia；不编译 wgpu、glow 或 sysinfo。
 
-GUI 相关：`packages/eorzea-app/src/ui/mod.rs` 是根组件与 `AppState`（标签页、auth.toml/config.toml 内存镜像、
-大区缓存、本会话 token 缓存、底部状态栏），通过 dioxus context 共享给
-`ui/login.rs`（账号列表 + 扫码/推送/密码登录）、`ui/home.rs`
-（账号/大区选择、版本、检查/更新游戏、启动）、`ui/settings.rs`（游戏目录与 Wine 配置）。
-所有耗时操作（登录、等扫码、下载）在 dioxus `spawn` 异步任务中执行
-（dioxus-native 内置 tokio runtime），不阻塞 UI 线程。
+GUI 相关：`packages/eorzea-app/src/ui/mod.rs` 的 `App` 根状态持有账号/配置镜像、跨页设置草稿、
+登录任务 generation、全局更新/启动互斥、进度和日志。`ui/backend.rs` 与 Iced executor 共享两个 worker 的 Tokio runtime，
+执行登录/配置读写/更新/启动，以事件及合并的最新进度回到根状态，通过 `Notify` 订阅唤醒；空闲不轮询。
+`ui/login.rs` 为真实扫码/推送/密码登录和账号持久化；`ui/home.rs` 复用 `GameFileManager` 和
+`Launcher::launch_account`，不缓存游戏 ticket；`ui/settings.rs` 保存现有 config.toml 格式。
+阻塞初始化和配置写入放 `spawn_blocking`，任务不随切页丢失。
+`ui/footer.rs` 提供跨页版本/最新日志底栏与日志抽屉；操作结果用独立短提示。
+`ui/motion.rs` 的 Iced Animation 状态在控件内，仅过渡期间请求绘制，不使用逐帧应用消息或常驻计时器；
+`EORZEA_REDUCED_MOTION=1` 可关闭动效。
+
+**桌面测试限制**：用户禁止擅自在其工作桌面打开 GUI、截图/portal、切工作区或抢焦点。
+默认仅运行编译、纯状态测试和 Iced/tiny-skia 内存布局/绘制/控件事件测试，不启动 `cargo run`。
+真实窗口/IME/平台测量须先取得用户明确许可或确认真正隔离的 compositor/headless 环境。
 
 **Current focus: SDO (中国服/盛趣) authentication and game launch.** The `se` (international) feature is implemented but not the priority.
 

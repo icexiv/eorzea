@@ -1,454 +1,968 @@
-//! dioxus-native（Blitz 渲染）GUI。
-//!
-//! 页面：登录 / 主页 / 设置。所有耗时操作（登录、等扫码、检查更新、下载）
-//! 都在 dioxus `spawn` 的异步任务里执行（dioxus-native 内置 tokio runtime），
-//! 不阻塞 UI 线程。
-//!
-//! 视觉风格：shadcn/ui（zinc 亮色系），语义色见 [`theme::Theme`]，
-//! 无阴影无渐变；圆角 6~8px；强调色为黑白对比（primary 按钮底色/文字反转）。
-
+//! Production Iced/tiny-skia UI. Root-owned tasks survive page changes.
+mod backend;
+mod footer;
 mod home;
+mod log_view;
 mod login;
+mod motion;
 mod settings;
-mod theme;
+mod state;
+#[cfg(test)]
+mod tests;
+pub mod theme;
 
-pub use theme::Theme;
+use backend::{Bus, Event};
+use eorzea::{
+    auth::AuthConfig, config::AppConfig, dalamud::DalamudStatus, game_files::UpdateProgress,
+    launcher::Launcher,
+};
+use eorzea_auth::{PatchListEntry, SdoArea};
+use iced::widget::{
+    button, column, container, mouse_area, opaque, row, scrollable, space, stack, svg, tooltip,
+};
+use iced::{Element, Fill, Subscription, Task};
+use state::{Draft, Login, LoginMethod, LoginPhase, Operation, Tab};
+use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use theme::*;
 
-use std::path::PathBuf;
-use std::sync::Arc;
+static RUNTIME: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {
+    Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("GUI async runtime"),
+    )
+});
+/// Iced subscriptions and production workers share just two Tokio workers.
+pub struct Executor(Arc<tokio::runtime::Runtime>);
+impl iced::Executor for Executor {
+    fn new() -> Result<Self, std::io::Error> {
+        Ok(Self(RUNTIME.clone()))
+    }
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.0.spawn(future);
+    }
+    fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.0.enter();
+        f()
+    }
+    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
+        self.0.block_on(future)
+    }
+}
+#[derive(Clone)]
+struct Wake(Arc<tokio::sync::Notify>);
+impl std::hash::Hash for Wake {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        std::ptr::hash(Arc::as_ptr(&self.0), h);
+    }
+}
 
-use dioxus::dioxus_core::spawn_forever;
-use dioxus::prelude::*;
-use eorzea::auth::{self, AuthConfig};
-use eorzea::config::{self, DownloadSettings, WineSettings};
-use eorzea::dalamud::model::DalamudSettings;
-use eorzea::launcher::{LaunchToken, Launcher};
-use eorzea_auth::SdoArea;
-
-/// 侧边栏页面。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
+#[derive(Clone)]
+pub enum Msg {
+    Wake,
+    Page(Tab),
+    Drop(&'static str),
+    Select(&'static str, String),
+    Dismiss,
+    Field(&'static str, String),
+    Toggle(&'static str, bool),
+    Segment(&'static str, usize),
+    AddAccount,
+    CloseLogin,
     Login,
-    Home,
-    Settings,
+    CancelLogin,
+    RetrySave,
+    Default(String),
+    Delete(String),
+    ConfirmDelete,
+    Check,
+    Update,
+    Launch,
+    Copy,
+    LogAction(iced::widget::text_editor::Action),
+    FollowLogs,
+    ToggleLogs,
+    DismissNotice,
+    NoticeExpired(u64),
+    Save,
+    Restore,
+    Browse,
+    RetryAreas,
+    CloseRequested,
+    ConfirmExit,
+    CancelExit,
+    Escape,
+    TabKey(bool),
+}
+// Never expose password-bearing input messages in framework diagnostics.
+impl std::fmt::Debug for Msg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UI message (values redacted)")
+    }
 }
 
-/// 跨页面共享的应用状态（signal 均为 Copy，可直接放入 context）。
-#[derive(Clone, Copy)]
-pub struct AppState {
-    pub tab: Signal<Tab>,
-    /// `auth.toml` 的内存镜像（改动后立即写盘）。
-    pub auth_cfg: Signal<AuthConfig>,
-    /// `config.toml` 的内存镜像（设置页保存后写盘）。
-    pub settings: Signal<WineSettings>,
-    /// 游戏根目录（config.toml 顶层 `game_path`）。
-    pub game_path: Signal<Option<PathBuf>>,
-    /// `[dalamud]` section 的内存镜像（设置页保存后写盘）。
-    pub dalamud_cfg: Signal<DalamudSettings>,
-    pub download_cfg: Signal<DownloadSettings>,
-    /// 大区列表（按 area_order 排序）。
-    pub areas: Signal<Vec<SdoArea>>,
-    /// 主页选中的账号（snda_id）。
-    pub selected_account: Signal<Option<String>>,
-    /// 主页选中大区（area_id）。
-    pub selected_area: Signal<Option<String>>,
-    /// 底部全局状态栏文本。
-    pub status: Signal<String>,
-    /// 启动流程进行中（全局：切换页面后按钮仍保持加载状态）。
-    pub launching: Signal<bool>,
-    /// 更新任务与进度属于根组件，切换页面不会取消或重置。
-    pub update_state: Signal<home::UpdateState>,
-    pub update_patches: Signal<Vec<eorzea_auth::PatchListEntry>>,
-    pub update_progress: Signal<Option<eorzea::game_files::UpdateProgress>>,
-    /// 应用内日志（`tracing` INFO 及以上，最新在末尾）。
-    pub logs: Signal<Vec<crate::logging::LogEntry>>,
-    /// 当前展开的下拉框 id（全局同时只允许一个展开；None = 全部收起）。
-    pub open_dropdown: Signal<Option<&'static str>>,
-    /// 添加账号弹窗独立于页面滚动区，最后绘制以避免原生层叠遮挡。
-    pub adding_account: Signal<bool>,
-    /// 登录/启动链路（设备指纹采集在启动时完成）。
-    pub launcher: Signal<Option<Arc<Launcher>>>,
-    /// 界面语义色。
-    pub theme: Signal<Theme>,
+pub struct App {
+    runtime: Arc<tokio::runtime::Runtime>,
+    bus: Bus,
+    rx: mpsc::Receiver<Event>,
+    config: AppConfig,
+    auth: AuthConfig,
+    draft: Draft,
+    loaded: bool,
+    launcher: Option<Arc<Launcher>>,
+    tab: Tab,
+    areas: Vec<SdoArea>,
+    area_loading: bool,
+    area_error: Option<String>,
+    selected_account: Option<String>,
+    selected_area: Option<String>,
+    status: String,
+    operation: Operation,
+    operation_generation: u64,
+    patches: Vec<PatchListEntry>,
+    update_message: String,
+    update_error: bool,
+    update_progress: Option<UpdateProgress>,
+    login: Login,
+    confirm_delete: Option<String>,
+    auth_busy: bool,
+    settings_busy: bool,
+    folder_busy: bool,
+    path_generation: u64,
+    draft_game_found: Option<bool>,
+    settings_error: Option<String>,
+    dalamud_this_launch: bool,
+    inspection_generation: u64,
+    local: backend::LocalSummary,
+    dalamud_loading: bool,
+    dalamud: Option<DalamudStatus>,
+    logs: Vec<crate::logging::LogEntry>,
+    log_view: log_view::LogView,
+    log_seq: u64,
+    logs_open: bool,
+    notice: Option<(u64, String)>,
+    notice_generation: u64,
+    notice_pending: bool,
+    open_dropdown: Option<&'static str>,
+    exit_dialog: bool,
+    exit_when_idle: bool,
 }
-
-impl AppState {
-    /// 登录成功后保存可续期凭据；游戏 ticket 不缓存，启动时重新认证。
-    pub fn on_login_success(&mut self, token: LaunchToken) {
-        let mut cfg = auth::load(&auth::config_path());
-        let make_default = cfg.default_account().is_none();
-        // 账号里存大区名称（对齐 XIVLauncherCN 的 AreaName），数字 ID 只在内部使用
-        let selected_area = self.selected_area.read().clone();
-        let area_name = selected_area.and_then(|id| {
-            self.areas
-                .read()
-                .iter()
-                .find(|a| a.area_id == id)
-                .map(|a| a.area_name.clone())
-        });
-        cfg.upsert(
-            auth::Account {
-                snda_id: token.snda_id.clone(),
-                username: token.username.clone(),
-                auto_login_session_key: token.auto_login_session_key.clone(),
-                // 新增账号继承当前选中的大区，作为该账号的默认大区
-                area: area_name,
-            },
-            make_default,
+impl App {
+    pub fn new() -> Self {
+        let app = Self::empty(RUNTIME.clone());
+        crate::logging::set_wakeup(app.bus.wake.clone());
+        backend::initialize(&app.runtime, app.bus.clone());
+        app
+    }
+    fn empty(runtime: Arc<tokio::runtime::Runtime>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let bus = Bus {
+            tx,
+            progress: Arc::new(Mutex::new(None)),
+            launch_status: Arc::new(Mutex::new(None)),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        };
+        let config = AppConfig::default();
+        let draft = Draft::new(&config);
+        Self {
+            runtime,
+            bus,
+            rx,
+            config,
+            auth: AuthConfig::default(),
+            draft,
+            loaded: false,
+            launcher: None,
+            tab: Tab::Home,
+            areas: Vec::new(),
+            area_loading: true,
+            area_error: None,
+            selected_account: None,
+            selected_area: None,
+            status: "正在初始化…".into(),
+            operation: Operation::Idle,
+            operation_generation: 0,
+            patches: Vec::new(),
+            update_message: String::new(),
+            update_error: false,
+            update_progress: None,
+            login: Login::default(),
+            confirm_delete: None,
+            auth_busy: false,
+            settings_busy: false,
+            folder_busy: false,
+            path_generation: 0,
+            draft_game_found: None,
+            settings_error: None,
+            dalamud_this_launch: false,
+            inspection_generation: 0,
+            local: Default::default(),
+            dalamud_loading: false,
+            dalamud: None,
+            logs: Vec::new(),
+            log_view: log_view::LogView::default(),
+            log_seq: 0,
+            logs_open: false,
+            notice: None,
+            notice_generation: 0,
+            notice_pending: false,
+            open_dropdown: None,
+            exit_dialog: false,
+            exit_when_idle: false,
+        }
+    }
+    pub fn subscription(&self) -> Subscription<Msg> {
+        Subscription::batch([
+            Subscription::run_with(Wake(self.bus.wake.clone()), |wake| {
+                iced::futures::stream::unfold(wake.clone(), |wake| async move {
+                    wake.0.notified().await;
+                    Some((Msg::Wake, wake))
+                })
+            }),
+            iced::event::listen_with(|event, status, _| match event {
+                iced::Event::Window(iced::window::Event::CloseRequested) => {
+                    Some(Msg::CloseRequested)
+                }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Msg::Escape),
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                    modifiers,
+                    ..
+                }) if status == iced::event::Status::Ignored => {
+                    Some(Msg::TabKey(modifiers.shift()))
+                }
+                _ => None,
+            }),
+        ])
+    }
+    fn critical_busy(&self) -> bool {
+        self.operation.busy() || self.auth_busy || self.settings_busy
+    }
+    fn modal_open(&self) -> bool {
+        self.login.open || self.confirm_delete.is_some() || self.exit_dialog
+    }
+    fn refresh_summary(&mut self) {
+        self.inspection_generation += 1;
+        self.dalamud_loading = self.dalamud_this_launch;
+        self.dalamud = None;
+        backend::inspect(
+            &self.runtime,
+            self.bus.clone(),
+            self.inspection_generation,
+            self.config.clone(),
+            self.dalamud_this_launch,
         );
-        if let Err(e) = auth::save(&auth::config_path(), &cfg) {
-            self.status.set(format!(
-                "登录成功，但保存账号配置失败，请检查后重新登录: {e}"
-            ));
-            return;
-        }
-        self.auth_cfg.set(cfg);
-        self.selected_account.set(Some(token.snda_id.clone()));
-        self.status.set("账号已添加".to_string());
-        self.adding_account.set(false);
     }
-}
-
-/// 根组件：侧边栏导航 + 页面内容 + 状态栏。
-pub fn app() -> Element {
-    let initial_config = config::load_app_default();
-    let initial_auth = auth::load(&auth::config_path());
-    // 首次启动直接落到登录页；已有账号和游戏目录时再进入主页。
-    let initial_tab = if initial_auth.accounts.is_empty() || initial_config.game_path.is_none() {
-        Tab::Login
-    } else {
-        Tab::Home
-    };
-    // 大区默认值：默认账号的 area → config.toml 旧 area（兼容）→ 大区列表第一个
-    let initial_area = initial_auth
-        .default_account()
-        .and_then(|a| a.area.clone())
-        .or_else(|| initial_config.area.clone());
-    let mut state = AppState {
-        tab: use_signal(|| initial_tab),
-        auth_cfg: use_signal(|| initial_auth),
-        #[cfg(not(target_os = "windows"))]
-        settings: use_signal(|| initial_config.settings.clone()),
-        // Windows 的配置没有 Wine 字段；UI 仍保留一份默认值，
-        // 供隐藏的 Wine 界面代码与 `launch_game` 参数使用（原生分支会忽略）。
-        #[cfg(target_os = "windows")]
-        settings: use_signal(WineSettings::default),
-        game_path: use_signal(|| initial_config.game_path.clone()),
-        dalamud_cfg: use_signal(|| initial_config.dalamud.clone()),
-        download_cfg: use_signal(|| initial_config.download.clone()),
-        areas: use_signal(Vec::new),
-        selected_account: use_signal(|| None),
-        selected_area: use_signal(|| None),
-        status: use_signal(String::new),
-        launching: use_signal(|| false),
-        update_state: use_signal(|| home::UpdateState::Idle),
-        update_patches: use_signal(Vec::new),
-        update_progress: use_signal(|| None),
-        logs: use_signal(Vec::new),
-        open_dropdown: use_signal(|| None),
-        adding_account: use_signal(|| false),
-        launcher: use_signal(|| None),
-        theme: use_signal(Theme::light),
-    };
-    use_context_provider(|| state);
-
-    // 把 tracing 日志增量搬进 signal，供主页「运行日志」区域展示。
-    // 用 root scope 的常驻任务，切换页面不会中断；轮询期间不持有日志缓冲锁。
-    #[cfg(not(target_arch = "wasm32"))]
-    use_hook(move || {
-        spawn_forever(async move {
-            let mut seq = 0u64;
-            loop {
-                let (entries, total) = crate::logging::snapshot_since(seq);
-                if total != seq {
-                    seq = total;
-                    let mut logs = state.logs.write();
-                    logs.extend(entries);
-                    let overflow = logs.len().saturating_sub(crate::logging::MAX_UI_LINES);
-                    if overflow > 0 {
-                        logs.drain(0..overflow);
-                    }
+    fn choose_account(&mut self, id: String) {
+        let area = self
+            .auth
+            .find(&id)
+            .and_then(|a| a.area.clone())
+            .or_else(|| self.config.area.clone());
+        self.selected_account = Some(id);
+        self.select_area_value(area.as_deref());
+    }
+    fn select_area_value(&mut self, value: Option<&str>) {
+        self.selected_area = value
+            .and_then(|v| {
+                self.areas
+                    .iter()
+                    .find(|a| a.area_id == v || a.area_name == v)
+            })
+            .or_else(|| self.areas.first())
+            .map(|a| a.area_id.clone());
+    }
+    fn selected_area(&self) -> Option<SdoArea> {
+        self.areas
+            .iter()
+            .find(|a| Some(a.area_id.as_str()) == self.selected_area.as_deref())
+            .cloned()
+    }
+    fn drain(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            self.accept(event);
+        }
+        let progress = self
+            .bus
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((generation, progress)) = progress {
+            if generation == self.operation_generation {
+                if self.config.game_path.is_some()
+                    && self.update_progress.as_ref().map(|p| p.install.completed)
+                        != Some(progress.install.completed)
+                {
+                    backend::refresh_local(
+                        &self.runtime,
+                        self.bus.clone(),
+                        self.inspection_generation,
+                        self.config.clone(),
+                    );
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                self.update_progress = Some(progress);
             }
-        });
-    });
-
-    // 启动时初始化 Launcher（设备指纹）并拉取大区列表。
-    use_hook(move || {
-        spawn(async move {
-            match Launcher::new() {
-                Ok(l) => state.launcher.set(Some(Arc::new(l))),
-                Err(e) => state.status.set(format!("初始化失败: {e}")),
+        }
+        let status = self
+            .bus
+            .launch_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((generation, status)) = status {
+            if generation == self.operation_generation && self.operation == Operation::Launching {
+                self.status = status;
             }
-            match eorzea_auth::sdo::SdoAuth::fetch_server_list().await {
-                Ok(mut list) => {
-                    list.sort_by_key(|a| a.area_order);
-                    // 默认选中账号的默认大区（按名称匹配，兼容旧配置的数字 ID）；
-                    // 不在列表中时退回第一个大区
-                    if let Some(first) = list
-                        .iter()
-                        .find(|a| {
-                            initial_area
-                                .as_deref()
-                                .is_some_and(|v| a.area_name == v || a.area_id == v)
-                        })
-                        .or_else(|| list.first())
+        }
+        let (entries, seq) = crate::logging::snapshot_since(self.log_seq);
+        self.log_seq = seq;
+        let changed = !entries.is_empty();
+        self.logs.extend(entries);
+        let overflow = self.logs.len().saturating_sub(crate::logging::MAX_UI_LINES);
+        self.logs.drain(..overflow);
+        if changed {
+            self.log_view.sync(&self.logs);
+        }
+    }
+    fn accept(&mut self, event: Event) {
+        match event {
+            Event::Config(config, auth) => {
+                self.dalamud_this_launch = config.dalamud.enabled;
+                self.tab = if auth.accounts.is_empty() {
+                    Tab::Accounts
+                } else if config.game_path.is_none() {
+                    Tab::Settings
+                } else {
+                    Tab::Home
+                };
+                self.selected_account = state::initial_account(&auth);
+                self.auth = auth;
+                self.draft = Draft::new(&config);
+                self.config = config;
+                self.loaded = true;
+                self.status = "准备就绪".into();
+                self.refresh_summary();
+            }
+            Event::Launcher(result) => match result {
+                Ok(launcher) => {
+                    self.launcher = Some(launcher);
+                    if self.login.open
+                        && self.login.method == LoginMethod::Qr
+                        && self.login.phase == LoginPhase::Idle
                     {
-                        state.selected_area.set(Some(first.area_id.clone()));
+                        self.start_login();
                     }
-                    state.areas.set(list);
                 }
-                Err(e) => state.status.set(format!("获取大区列表失败: {e}")),
-            }
-            // 默认选中默认账号
-            if let Some(acc) = state.auth_cfg.read().default_account() {
-                state.selected_account.set(Some(acc.snda_id.clone()));
-            }
-        });
-    });
-
-    let tab = state.tab;
-    let t = (state.theme)();
-    rsx! {
-        // blitz 默认 UA 样式表带 `body { margin: 8px }`，窗口白底会从四周透出，
-        // 这里注入静态样式重置（blitz 会把 mutation 插入的 <style> 编译为 author 样式表）
-        style { "html, body {{ margin: 0; padding: 0; }}" }
-        div {
-            // 字体栈显式指定中文字体：blitz 缺少逐字符回退，默认拉丁字体没有
-            // 全角标点（（）等），紧邻西文时渲染为方块；中文字体同时覆盖
-            // 拉丁字形与全角标点，两端一致
-            style: "position: relative; display: flex; flex-direction: row; width: 100vw; height: 100vh; font-family: \"Microsoft YaHei\", \"PingFang SC\", \"Noto Sans CJK SC\", \"Source Han Sans SC\", sans-serif; background: {t.page_bg}; color: {t.text};",
-            // 点击任意下拉外部区域收起展开的下拉：事件冒泡到根容器即收起
-            // （下拉容器内部用 stop_propagation 阻断，不依赖 CSS 层叠，
-            // web 与原生 blitz 行为一致）
-            onclick: move |_| state.open_dropdown.set(None),
-
-            // 侧边栏导航
-            div {
-                style: "box-sizing: border-box; width: 72px; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; padding: 16px 10px; border-right: 1px solid {t.border};",
-                NavButton { label: "游戏", target: Tab::Home, tab }
-                NavButton { label: "账号管理", target: Tab::Login, tab }
-
-                // 设置固定在底部，与日常游戏/账号操作分组。
-                div { style: "flex: 1;" }
-                NavButton { label: "设置", target: Tab::Settings, tab }
-            }
-
-            // 右栏：页面内容 + 状态栏。
-            // 滚动由各页面自持（设置页需要把保存栏固定在滚动区外）
-            div {
-                style: "flex: 1; min-height: 0; display: flex; flex-direction: column; min-width: 0;",
-                match tab() {
-                    Tab::Login => rsx! { login::LoginPage {} },
-                    Tab::Home => rsx! { home::HomePage {} },
-                    Tab::Settings => rsx! { settings::SettingsPage {} },
-                }
-
-                // 状态栏。overflow-wrap: anywhere 让无空格长串（URL/路径）
-                // 也能断行，避免超长错误信息单行溢出窗口
-                div {
-                    style: "padding: 8px 28px; border-top: 1px solid {t.border}; font-size: 12px; line-height: 1.5; color: {t.text_secondary}; overflow-wrap: anywhere;",
-                    "{state.status}"
-                }
-            }
-            // 必须在页面及状态栏之后绘制，避免 Blitz 的层叠顺序限制。
-            if (state.adding_account)() {
-                login::AddAccountDialog {}
-            }
-        }
-    }
-}
-
-#[component]
-fn NavButton(label: &'static str, target: Tab, tab: Signal<Tab>) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    let active = tab() == target;
-    let bg = if active { t.active_bg } else { "transparent" };
-    let fg = if active { t.text } else { t.text_secondary };
-    // SVG 线条图标不依赖字体字形，避免原生 blitz 的符号缺字问题。
-    let icon_path = match target {
-        Tab::Home => "m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z",
-        Tab::Login => {
-            "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z"
-        }
-        Tab::Settings => {
-            "m9 3-1 3-3 1-2 3 2 2-2 2 2 3 3 1 1 3h6l1-3 3-1 2-3-2-2 2-2-2-3-3-1-1-3ZM15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"
-        }
-    };
-    rsx! {
-        button {
-            r#type: "button",
-            title: label,
-            "aria-label": label,
-            "aria-current": if active { "page" } else { "false" },
-            style: "display: flex; align-items: center; justify-content: center; height: 48px; flex-shrink: 0; padding: 0; border: none; border-radius: 8px; background: {bg}; color: {fg}; cursor: pointer;",
-            // 切页时冒泡到根容器的 onclick 会顺带收起展开的下拉
-            onclick: move |_| tab.set(target),
-            svg {
-                width: "22",
-                height: "22",
-                view_box: "0 0 24 24",
-                fill: "none",
-                stroke: fg,
-                stroke_width: "1.75",
-                stroke_linecap: "round",
-                stroke_linejoin: "round",
-                "aria-hidden": "true",
-                path { d: icon_path }
-            }
-        }
-    }
-}
-
-/// 自定义下拉框（blitz 暂不支持原生 `select`，用按钮 + 展开列表实现）。
-///
-/// 注意：
-/// - 按钮用 `display: block` 撑满容器而不是 `width: 100%`——
-///   后者在 content-box 下会叠加 padding/border 导致横向溢出。
-/// - 展开列表走文档流内联展开（不用 `position: absolute + z-index`）：
-///   原生 blitz 渲染器对层叠上下文支持不完整，绝对定位的弹层会被
-///   文档序靠后的卡片遮挡；内联展开把下方内容顶开，两端渲染一致。
-/// - 展开状态收在全局 `AppState.open_dropdown`（`id` 区分实例）：
-///   同时只允许一个展开，且点击外部（事件冒泡到根容器）收起。
-#[component]
-pub fn Dropdown(
-    id: &'static str,
-    items: Vec<(String, String)>,
-    selected: Signal<Option<String>>,
-    placeholder: &'static str,
-    /// 选中项变化后的回调（用于把选择写回账号等）。
-    #[props(default)]
-    onchange: Option<EventHandler<String>>,
-) -> Element {
-    let mut open_dropdown = use_context::<AppState>().open_dropdown;
-    let is_open = open_dropdown() == Some(id);
-    let t = (use_context::<AppState>().theme)();
-    let current = selected
-        .read()
-        .as_ref()
-        .and_then(|id| items.iter().find(|(k, _)| k == id))
-        .map(|(_, name)| name.clone());
-    let label_color = if current.is_some() {
-        t.text
-    } else {
-        t.text_secondary
-    };
-    let current_label = current.unwrap_or_else(|| placeholder.to_string());
-    // SVG 不依赖字体字形；箭头固定在右侧，不再紧跟选项文字。
-    let arrow_path = if is_open {
-        "m6 15 6-6 6 6"
-    } else {
-        "m6 9 6 6 6-6"
-    };
-    let trigger_border = if is_open {
-        t.text_secondary
-    } else {
-        t.input_border
-    };
-
-    rsx! {
-        div {
-            style: "display: flex; flex-direction: column; min-width: 0;",
-            // 阻断冒泡：下拉内部（按钮切换/选项选择）的点击不触发根容器的
-            // 「点击外部收起」；点击其它下拉按钮时，其 onclick 直接替换
-            // open_dropdown，前一个自动收起（互斥不依赖根容器）
-            onclick: move |e: MouseEvent| e.stop_propagation(),
-            button {
-                r#type: "button",
-                title: "{current_label}",
-                "aria-label": "{placeholder}：{current_label}",
-                "aria-expanded": is_open,
-                "aria-controls": "{id}-options",
-                style: "box-sizing: border-box; display: flex; align-items: center; gap: 12px; min-height: 40px; padding: 8px 12px; border: 1px solid {trigger_border}; border-radius: 6px; background: {t.card_bg}; color: {label_color}; font-size: 14px; text-align: left; cursor: pointer;",
-                onkeydown: move |event: KeyboardEvent| {
-                    if event.key() == Key::Escape {
-                        open_dropdown.set(None);
+                Err(e) => self.status = format!("初始化失败: {e}"),
+            },
+            Event::Areas(result) => {
+                self.area_loading = false;
+                match result {
+                    Ok(areas) => {
+                        self.area_error = None;
+                        self.areas = areas;
+                        let value = self
+                            .selected_account
+                            .as_deref()
+                            .and_then(|id| self.auth.find(id))
+                            .and_then(|a| a.area.clone())
+                            .or_else(|| self.config.area.clone());
+                        self.select_area_value(value.as_deref());
                     }
-                },
-                onclick: move |_| {
-                    open_dropdown.set(if is_open { None } else { Some(id) });
-                },
-                // 避免在原生渲染器中对拉伸的 span 建立裁剪区域。
-                // 长标签允许换行，箭头保持独立且不参与收缩。
-                div {
-                    style: "flex: 1; min-width: 0; line-height: 20px; overflow-wrap: anywhere;",
-                    "{current_label}"
-                }
-                svg {
-                    style: "flex-shrink: 0;",
-                    width: "16",
-                    height: "16",
-                    view_box: "0 0 24 24",
-                    fill: "none",
-                    stroke: t.text_secondary,
-                    stroke_width: "1.75",
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                    "aria-hidden": "true",
-                    path { d: arrow_path }
+                    Err(e) => {
+                        self.area_error = Some(e.clone());
+                        self.status = format!("获取大区列表失败: {e}");
+                    }
                 }
             }
-            if is_open {
-                div {
-                    id: "{id}-options",
-                    style: "display: flex; flex-direction: column; gap: 2px; margin-top: 4px; max-height: 240px; overflow-y: auto; background: {t.card_bg}; border: 1px solid {t.border}; border-radius: 6px; padding: 4px;",
-                    onkeydown: move |event: KeyboardEvent| {
-                        if event.key() == Key::Escape {
-                            open_dropdown.set(None);
-                        }
-                    },
-                    if items.is_empty() {
-                        div {
-                            style: "padding: 8px 12px; color: {t.text_secondary}; font-size: 13px;",
-                            "暂无选项"
-                        }
+            Event::Local(generation, local) if generation == self.inspection_generation => {
+                self.local = local
+            }
+            Event::Dalamud(generation, status) if generation == self.inspection_generation => {
+                self.dalamud_loading = false;
+                self.dalamud = status;
+            }
+            Event::Qr(generation, bytes)
+                if self.login.open && self.login.task.accepts(generation) =>
+            {
+                match decode_qr(&bytes) {
+                    Ok(qr) => {
+                        self.login.qr = Some(qr);
+                        self.login.phase = LoginPhase::Waiting;
                     }
-                    for (id, name) in items {
+                    Err(e) => {
+                        self.login.task.cancel();
+                        self.login.phase = LoginPhase::Failed;
+                        self.login.error = Some(e);
+                    }
+                }
+            }
+            Event::Push(generation, serial)
+                if self.login.open && self.login.task.accepts(generation) =>
+            {
+                self.login.serial = serial;
+                self.login.phase = LoginPhase::Waiting;
+            }
+            Event::Login(generation, result)
+                if self.login.open && self.login.task.accepts(generation) =>
+            {
+                match result {
+                    Ok(token) => {
+                        self.login.pending_token = Some(token);
+                        self.persist_login();
+                    }
+                    Err(e) => {
+                        self.login.phase = LoginPhase::Failed;
+                        self.login.error = Some(e);
+                    }
+                }
+            }
+            Event::AuthSaved {
+                login,
+                selected,
+                result,
+            } => {
+                self.notice_pending = true;
+                self.auth_busy = false;
+                match result {
+                    Ok(auth) => {
+                        self.auth = auth;
+                        if let Some(id) = selected {
+                            self.choose_account(id);
+                        } else if self
+                            .selected_account
+                            .as_ref()
+                            .is_some_and(|id| self.auth.find(id).is_none())
                         {
-                            let is_selected = selected.read().as_deref() == Some(id.as_str());
-                            let bg = if is_selected { t.active_bg } else { "transparent" };
-                            rsx! {
-                                button {
-                                    key: "{id}",
-                                    r#type: "button",
-                                    title: "{name}",
-                                    "aria-pressed": is_selected,
-                                    style: "box-sizing: border-box; display: flex; align-items: center; gap: 12px; min-height: 36px; flex-shrink: 0; padding: 8px; border: none; border-radius: 4px; background: {bg}; color: {t.text}; font-size: 14px; text-align: left; cursor: pointer;",
-                                    onclick: move |_| {
-                                        selected.set(Some(id.clone()));
-                                        open_dropdown.set(None);
-                                        if let Some(onchange) = onchange {
-                                            onchange.call(id.clone());
-                                        }
-                                    },
-                                    div {
-                                        style: "flex: 1; min-width: 0; line-height: 20px; overflow-wrap: anywhere;",
-                                        "{name}"
-                                    }
-                                    div {
-                                        style: "display: flex; align-items: center; width: 16px; height: 16px; flex-shrink: 0;",
-                                        if is_selected {
-                                            svg {
-                                                width: "16",
-                                                height: "16",
-                                                view_box: "0 0 24 24",
-                                                fill: "none",
-                                                stroke: t.text,
-                                                stroke_width: "1.75",
-                                                stroke_linecap: "round",
-                                                stroke_linejoin: "round",
-                                                "aria-hidden": "true",
-                                                path { d: "m5 12 4 4L19 6" }
-                                            }
-                                        }
-                                    }
-                                }
+                            if let Some(id) = state::initial_account(&self.auth) {
+                                self.choose_account(id);
+                            } else {
+                                self.selected_account = None;
                             }
                         }
+                        self.status = "账号配置已保存".into();
+                        if login.is_some_and(|g| self.login.task.accepts(g)) {
+                            self.login.close();
+                        }
+                    }
+                    Err(e) => {
+                        self.status = e.clone();
+                        if login.is_some_and(|g| self.login.task.accepts(g)) {
+                            self.login.phase = LoginPhase::Failed;
+                            self.login.error = Some(e);
+                        }
                     }
                 }
             }
+            Event::SettingsSaved(result) => {
+                self.notice_pending = true;
+                self.settings_busy = false;
+                match result {
+                    Ok(config) => {
+                        self.config = config;
+                        self.draft = Draft::new(&self.config);
+                        self.dalamud_this_launch = self.config.dalamud.enabled;
+                        self.settings_error = None;
+                        self.status = "设置已保存".into();
+                        self.patches.clear();
+                        self.update_progress = None;
+                        self.update_message.clear();
+                        self.refresh_summary();
+                    }
+                    Err(e) => {
+                        self.settings_error = Some(e.clone());
+                        self.status = format!("保存设置失败: {e}");
+                    }
+                }
+            }
+            Event::Folder(path) => {
+                self.folder_busy = false;
+                if let Some(path) = path {
+                    self.change_game_path(path.to_string_lossy().into_owned());
+                }
+            }
+            Event::GamePath(generation, found) if generation == self.path_generation => {
+                self.draft_game_found = Some(found);
+            }
+            Event::Checked(generation, result) if generation == self.operation_generation => {
+                self.operation = Operation::Idle;
+                match result {
+                    Ok((patches, pending)) => {
+                        self.update_message = if patches.is_empty() {
+                            "游戏已是最新。".into()
+                        } else if pending {
+                            "发现未完成更新，点击更新游戏恢复原队列".into()
+                        } else {
+                            format!("发现 {} 个补丁，点击更新游戏开始下载。", patches.len())
+                        };
+                        self.patches = patches;
+                    }
+                    Err(e) => {
+                        self.update_error = true;
+                        self.update_message = e;
+                    }
+                }
+            }
+            Event::Updated(generation, result) if generation == self.operation_generation => {
+                self.operation = Operation::Idle;
+                match result {
+                    Ok(count) => {
+                        self.patches.clear();
+                        self.update_message = format!("更新完成（应用并清理 {count} 个补丁）");
+                    }
+                    Err(e) => {
+                        self.update_error = true;
+                        self.update_message =
+                            format!("更新失败: {e}。队列已保留，重新检查更新可恢复。");
+                    }
+                }
+                self.refresh_summary();
+            }
+            Event::LaunchStatus(generation, status)
+                if generation == self.operation_generation
+                    && self.operation == Operation::Launching =>
+            {
+                self.status = status
+            }
+            Event::AuthReload(auth) => self.auth = auth,
+            Event::Launched(generation, result) if generation == self.operation_generation => {
+                self.operation = Operation::Idle;
+                self.status = match result {
+                    Ok(pid) => {
+                        tracing::info!(pid, "游戏进程已启动");
+                        format!("游戏已启动（PID {pid}）")
+                    }
+                    Err(e) => {
+                        tracing::error!(error=%e,"游戏启动失败");
+                        format!("启动失败: {e}")
+                    }
+                };
+            }
+            _ => {}
         }
     }
+    pub fn update(&mut self, msg: Msg) -> Task<Msg> {
+        let previous_status = self.status.clone();
+        let was_loaded = self.loaded;
+        if !matches!(
+            msg,
+            Msg::Drop(_) | Msg::Wake | Msg::TabKey(_) | Msg::Escape | Msg::NoticeExpired(_)
+        ) {
+            self.open_dropdown = None;
+        }
+        match msg {
+            Msg::Wake => self.drain(),
+            Msg::Page(tab) if !self.modal_open() => {
+                self.tab = tab;
+                self.open_dropdown = None;
+            }
+            Msg::Drop(id) => {
+                self.open_dropdown = if self.open_dropdown == Some(id) {
+                    None
+                } else {
+                    Some(id)
+                };
+            }
+            Msg::Dismiss => self.open_dropdown = None,
+            Msg::Select(id, value) if !self.critical_busy() => {
+                self.open_dropdown = None;
+                match id {
+                    "account" => self.choose_account(value),
+                    "area" => {
+                        if let Some(account) = self.selected_account.clone() {
+                            if let Some(area) = self.areas.iter().find(|a| a.area_id == value) {
+                                self.persist_auth(
+                                    backend::AuthChange::Area(
+                                        account.clone(),
+                                        area.area_name.clone(),
+                                    ),
+                                    None,
+                                    Some(account),
+                                );
+                            }
+                        } else {
+                            self.selected_area = Some(value);
+                        }
+                    }
+                    "track" => self.draft.dalamud.track = value,
+                    _ => {}
+                }
+            }
+            Msg::Field(id, value) => self.set_field(id, value),
+            Msg::Toggle(id, value) => self.set_toggle(id, value),
+            Msg::Segment(id, n) => self.set_segment(id, n),
+            Msg::AddAccount if !self.critical_busy() => {
+                self.login.reset();
+                self.login.open = true;
+                self.login.method = LoginMethod::Qr;
+                self.open_dropdown = None;
+                if self.launcher.is_some() {
+                    self.start_login();
+                }
+            }
+            Msg::CloseLogin if self.login.phase != LoginPhase::Saving => self.login.close(),
+            Msg::Login if self.login.open && self.login.phase != LoginPhase::Saving => {
+                self.start_login()
+            }
+            Msg::CancelLogin if self.login.phase != LoginPhase::Saving => self.login.reset(),
+            Msg::RetrySave => self.persist_login(),
+            Msg::Default(id) => {
+                self.persist_auth(backend::AuthChange::Default(id.clone()), None, Some(id))
+            }
+            Msg::Delete(id) if !self.critical_busy() => self.confirm_delete = Some(id),
+            Msg::ConfirmDelete if !self.critical_busy() => {
+                if let Some(id) = self.confirm_delete.take() {
+                    self.persist_auth(backend::AuthChange::Delete(id), None, None);
+                }
+            }
+            Msg::Check => self.check_update(),
+            Msg::Update => self.run_update(),
+            Msg::Launch => self.launch_game(),
+            Msg::Copy => {
+                self.notice_pending = true;
+                let text = crate::logging::format_for_copy(&self.logs);
+                self.status = if text.is_empty() {
+                    "暂无可复制的日志".into()
+                } else {
+                    match crate::clipboard::copy_text(text) {
+                        Ok(()) => "日志已复制（按时间从旧到新排列）".into(),
+                        Err(e) => format!("复制日志失败: {e}"),
+                    }
+                };
+            }
+            Msg::LogAction(action) if self.logs_open && !self.modal_open() => {
+                self.log_view.action(action)
+            }
+            Msg::FollowLogs if !self.modal_open() => self.log_view.follow(&self.logs),
+            Msg::ToggleLogs if !self.modal_open() => self.logs_open = !self.logs_open,
+            Msg::DismissNotice => self.notice = None,
+            Msg::NoticeExpired(generation)
+                if self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == generation) =>
+            {
+                self.notice = None
+            }
+            Msg::Save if self.loaded && !self.critical_busy() && !self.folder_busy => {
+                match self.draft.apply(&self.config) {
+                    Ok(_) => {
+                        self.settings_busy = true;
+                        self.settings_error = None;
+                        backend::save_settings(&self.runtime, self.bus.clone(), self.draft.clone());
+                    }
+                    Err(e) => self.settings_error = Some(e),
+                }
+            }
+            Msg::Restore if !self.settings_busy && !self.folder_busy => {
+                self.draft = Draft::new(&self.config);
+                self.settings_error = None;
+            }
+            Msg::Browse if !self.settings_busy && !self.folder_busy => {
+                self.folder_busy = true;
+                let bus = self.bus.clone();
+                self.runtime.spawn(async move {
+                    let path = rfd::AsyncFileDialog::new()
+                        .set_title("选择游戏根目录")
+                        .pick_folder()
+                        .await
+                        .map(|f| f.path().to_path_buf());
+                    bus.send(Event::Folder(path));
+                });
+            }
+            Msg::RetryAreas if !self.area_loading => {
+                self.area_loading = true;
+                self.area_error = None;
+                self.runtime.spawn(backend::fetch_areas(self.bus.clone()));
+            }
+            Msg::CloseRequested => {
+                if self.critical_busy() || self.draft.dirty(&self.config) {
+                    self.exit_dialog = true;
+                } else {
+                    return iced::exit();
+                }
+            }
+            Msg::ConfirmExit => {
+                self.exit_dialog = false;
+                self.exit_when_idle = true;
+                if !self.critical_busy() {
+                    return iced::exit();
+                }
+            }
+            Msg::CancelExit => {
+                self.exit_dialog = false;
+                self.exit_when_idle = false;
+            }
+            Msg::Escape => {
+                if self.exit_dialog {
+                    self.exit_dialog = false;
+                    self.exit_when_idle = false;
+                } else if self.confirm_delete.is_some() {
+                    self.confirm_delete = None;
+                } else if self.login.open && self.login.phase != LoginPhase::Saving {
+                    self.login.close();
+                } else {
+                    if self.open_dropdown.take().is_none() && self.logs_open {
+                        self.logs_open = false;
+                    }
+                }
+            }
+            Msg::TabKey(reverse) => {
+                return if reverse {
+                    iced::widget::operation::focus_previous()
+                } else {
+                    iced::widget::operation::focus_next()
+                };
+            }
+            _ => {}
+        }
+        if self.exit_when_idle && !self.critical_busy() {
+            if self.draft.dirty(&self.config) {
+                self.exit_when_idle = false;
+                self.exit_dialog = true;
+            } else {
+                return iced::exit();
+            }
+        }
+        let force_notice = std::mem::take(&mut self.notice_pending);
+        if was_loaded
+            && self.loaded
+            && (self.status != previous_status || force_notice)
+            && !self.operation.busy()
+        {
+            self.notice_generation += 1;
+            let generation = self.notice_generation;
+            self.notice = Some((generation, self.status.clone()));
+            Task::perform(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                },
+                move |_| Msg::NoticeExpired(generation),
+            )
+        } else {
+            Task::none()
+        }
+    }
+    pub fn view(&self) -> Element<'_, Msg> {
+        let sidebar = container(
+            column![
+                self.nav(Tab::Home, 0),
+                self.nav(Tab::Accounts, 1),
+                space().height(Fill),
+                self.nav(Tab::Settings, 2)
+            ]
+            .spacing(8),
+        )
+        .padding([16, 10])
+        .width(71)
+        .height(Fill);
+        let page = if !self.loaded {
+            text("正在读取配置…").color(MUTED).into()
+        } else {
+            match self.tab {
+                Tab::Home => self.home(),
+                Tab::Accounts => self.accounts_page(),
+                Tab::Settings => self.settings_page(),
+            }
+        };
+        let mut right =
+            column![scrollable(container(page).padding([24, 28]).width(Fill)).height(Fill)];
+        if self.tab == Tab::Settings {
+            right = right.push(self.save_bar());
+        }
+        let main = mouse_area(
+            row![
+                sidebar,
+                container(space()).width(1).height(Fill).style(divider),
+                right.width(Fill).height(Fill)
+            ]
+            .height(Fill),
+        )
+        .on_press(Msg::Dismiss);
+        let drawer = self.logs_panel();
+        let notice = container(opaque(self.notice_view()))
+            .padding(16)
+            .align_right(Fill)
+            .align_bottom(Fill);
+        let content = stack![
+            main,
+            container(drawer).width(Fill).align_bottom(Fill),
+            notice
+        ];
+        let base: Element<'_, Msg> = column![content.height(Fill), self.footer()]
+            .height(Fill)
+            .into();
+        let body = if self.exit_dialog {
+            Some(self.exit_view())
+        } else if self.confirm_delete.is_some() {
+            Some(self.delete_view())
+        } else if self.login.open {
+            Some(self.login_view())
+        } else {
+            None
+        };
+        if let Some(body) = body {
+            stack![
+                base,
+                opaque(
+                    container(body)
+                        .padding(16)
+                        .center_x(Fill)
+                        .center_y(Fill)
+                        .style(|_| container::Style {
+                            background: Some(iced::Color::from_rgba(0., 0., 0., 0.35).into()),
+                            ..Default::default()
+                        })
+                )
+            ]
+            .into()
+        } else {
+            base
+        }
+    }
+    fn nav(&self, tab: Tab, index: usize) -> Element<'_, Msg> {
+        const PATHS: [&str; 3] = [
+            "m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z",
+            "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z",
+            "m9 3-1 3-3 1-2 3 2 2-2 2 2 3 3 1 1 3h6l1-3 3-1 2-3-2-2 2-2-2-3-3-1-1-3ZM15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z",
+        ];
+        let selected = self.tab == tab;
+        let color = if selected { "#09090b" } else { "#71717a" };
+        let icon=svg(svg::Handle::from_memory(format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='{color}' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'><path d='{}'/></svg>",PATHS[index]).into_bytes())).width(22).height(22);
+        let navigation = button(container(icon).center_x(Fill).center_y(Fill))
+            .width(52)
+            .height(48)
+            .padding(0)
+            .on_press_maybe((!self.modal_open()).then_some(Msg::Page(tab)))
+            .style(move |_, s| iced::widget::button::Style {
+                background: Some(
+                    match s {
+                        iced::widget::button::Status::Pressed => LINE,
+                        iced::widget::button::Status::Hovered if selected => LINE,
+                        iced::widget::button::Status::Hovered => ACTIVE,
+                        _ if selected => ACTIVE,
+                        _ => iced::Color::WHITE,
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    radius: 8.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        tooltip(
+            navigation,
+            text(["游戏", "账号管理", "设置"][index]).size(12),
+            tooltip::Position::Right,
+        )
+        .style(panel)
+        .into()
+    }
+    fn dropdown<'a>(
+        &'a self,
+        id: &'static str,
+        items: Vec<(String, String)>,
+        selected: Option<&str>,
+        hint: &str,
+        enabled: bool,
+    ) -> Element<'a, Msg> {
+        let label = items
+            .iter()
+            .find(|(key, _)| Some(key.as_str()) == selected)
+            .map(|(_, label)| label.clone())
+            .unwrap_or_else(|| hint.into());
+        let mut body = column![
+            button(row![
+                text(label),
+                space().width(Fill),
+                text("⌄").color(MUTED)
+            ])
+            .padding([10, 12])
+            .width(Fill)
+            .style(secondary)
+            .on_press_maybe(enabled.then_some(Msg::Drop(id)))
+        ]
+        .spacing(4);
+        if self.open_dropdown == Some(id) {
+            let mut options = column![].spacing(2);
+            for (key, label) in items {
+                let label = if Some(key.as_str()) == selected {
+                    format!("{label} ✓")
+                } else {
+                    label
+                };
+                options = options.push(
+                    button(text(label))
+                        .padding([8, 12])
+                        .width(Fill)
+                        .style(secondary)
+                        .on_press_maybe(enabled.then_some(Msg::Select(id, key))),
+                );
+            }
+            body = body.push(scrollable(options).height(iced::Length::Shrink));
+        }
+        body.width(Fill).into()
+    }
+    fn exit_view(&self) -> Element<'_, Msg> {
+        let busy = self.critical_busy();
+        card(
+            column![
+                heading(
+                    if busy {
+                        "任务进行中"
+                    } else {
+                        "有未保存的设置"
+                    },
+                    18
+                ),
+                text(if busy {
+                    "为避免中断补丁提交或凭据保存，请等待任务完成后退出。"
+                } else {
+                    "退出会丢弃设置草稿，已保存的配置不受影响。"
+                })
+                .color(MUTED),
+                row![
+                    btn("继续使用", Some(Msg::CancelExit), false),
+                    btn(
+                        if busy {
+                            "完成后退出"
+                        } else {
+                            "丢弃草稿并退出"
+                        },
+                        Some(Msg::ConfirmExit),
+                        true
+                    )
+                ]
+                .spacing(8)
+            ]
+            .spacing(20),
+        )
+        .max_width(440)
+        .into()
+    }
+}
+fn decode_qr(bytes: &[u8]) -> Result<iced::widget::image::Handle, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+    reader.set_format(image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(16 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
+        .decode()
+        .map_err(|e| format!("二维码解码失败: {e}"))?
+        .to_rgba8();
+    Ok(iced::widget::image::Handle::from_rgba(
+        image.width(),
+        image.height(),
+        image.into_raw(),
+    ))
 }

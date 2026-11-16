@@ -1,5 +1,5 @@
-//! 不读取账号或发起网络请求的原生文字布局对照。
-//! cargo run -p eorzea-app --example span_probe
+//! Blitz 调查用源码快照，不属于正式 GUI crate 的可编译 examples。
+//! 不读取账号或发起网络请求；复现需要单独的 Dioxus/Blitz 0.7.10 环境。
 
 use dioxus::prelude::*;
 
