@@ -1,6 +1,6 @@
 [workspace]
 members = ["packages/eorzea-app", "packages/eorzea-auth", "packages/eorzea-cli"]
-# 默认成员 = CLI：`cargo run` / `cargo check` 不再连带编译 dioxus/blitz。
+# 默认成员 = CLI：`cargo run` / `cargo check` 不连带编译 GUI。
 # GUI：`cargo run -p eorzea-app`。
 default-members = ["packages/eorzea-cli"]
 
@@ -51,3 +51,8 @@ required-features = ["eorzea-auth/sdo"]
 # 依赖开优化，不影响项目自身 debug 编译速度。
 [profile.dev.package.sha1]
 opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

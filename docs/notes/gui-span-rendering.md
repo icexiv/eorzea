@@ -33,17 +33,8 @@
 
 ## 独立对照
 
-添加了 `packages/eorzea-app/examples/span_probe.rs`，不读取账号或配置、不发起网络请求：
-
-```bash
-cargo run -p eorzea-app --example span_probe
-```
-
-也可在该 crate 目录使用同一个示例比较两个渲染后端：
-
-```bash
-dx serve --example span_probe --platform desktop --renderer native
-dx serve --example span_probe --platform web
-```
+旧对照源码保存在 [`fixtures/blitz-span-probe.rs.txt`](fixtures/blitz-span-probe.rs.txt)，不读取账号或配置、
+不发起网络请求。它需要单独的 Dioxus/Blitz 0.7.10 环境，不作为正式 GUI crate 的 Cargo example
+编译，也不能通过当前项目的 `cargo run --example` / `dx serve` 启动。保留源码不表示当前使用该渲染器。
 
 示例依次显示普通 inline span、flex + span + hidden 裁剪、flex + div 无裁剪、button 外的 div。下一步需要在出现横线的原生环境确认哪些行受影响，并比较完整重启、热更新及浏览器的差异；如都受影响，再排查字体 / GPU 绘制，而不是继续将问题归因于 span。取得最小复现证据后再考虑报告上游；本次未创建 issue 或升级渲染依赖。

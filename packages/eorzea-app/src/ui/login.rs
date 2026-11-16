@@ -1,32 +1,12 @@
-//! 账号卡片与添加账号弹窗（扫码 / 推送 / 密码）。
-
-use base64::Engine;
-use dioxus::core::Task;
-use dioxus::prelude::*;
-use eorzea::auth;
-
-use super::AppState;
-
-enum QrState {
-    Idle,
-    Loading,
-    Waiting(String),
-    Failed(String),
-}
-
-enum PushState {
-    Idle,
-    Loading,
-    Waiting(Option<String>),
-    Failed(String),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LoginMethod {
-    Qr,
-    Push,
-    Password,
-}
+use super::{
+    App, Msg,
+    backend::{self, AuthChange, Event},
+    state::{LoginMethod, LoginPhase},
+    theme::*,
+};
+use iced::widget::{button, column, container, image, row, scrollable, space};
+use iced::{Element, Fill};
+use zeroize::{Zeroize, Zeroizing};
 
 fn account_status(has_key: bool) -> &'static str {
     if has_key {
@@ -35,558 +15,341 @@ fn account_status(has_key: bool) -> &'static str {
         "未保存自动登录凭据，请重新添加账号"
     }
 }
-
-#[component]
-pub fn LoginPage() -> Element {
-    let mut state = use_context::<AppState>();
-    let t = (state.theme)();
-    let mut confirm_delete = use_signal(|| None::<String>);
-    let accounts = state.auth_cfg.read().accounts.clone();
-    let default_id = state
-        .auth_cfg
-        .read()
-        .default_account()
-        .map(|a| a.snda_id.clone());
-
-    rsx! {
-        div {
-            style: "flex: 1; min-height: 0; overflow-y: auto; padding: 24px 28px;",
-            div {
-                style: "display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px;",
-                h2 { style: "margin: 0; font-size: 20px; font-weight: 600; color: {t.text};", "账号管理" }
-                ActionButton {
-                    label: "添加账号",
-                    onclick: move |_| {
-                        confirm_delete.set(None);
-                        state.open_dropdown.set(None);
-                        state.adding_account.set(true);
-                    },
-                }
-            }
-            p {
-                style: "margin: 0 0 24px; color: {t.text_secondary}; font-size: 13px; line-height: 1.6;",
-                "管理本机保存的账号。启动游戏时会使用已有凭据自动登录。"
-            }
-            div {
-                style: "display: flex; flex-wrap: wrap; gap: 16px;",
-                if accounts.is_empty() {
-                    div {
-                        style: "flex: 1; padding: 32px 20px; border: 1px solid {t.border}; border-radius: 8px; background: {t.card_bg}; color: {t.text_secondary}; font-size: 14px; text-align: center;",
-                        "还没有保存的账号，点击「添加账号」开始登录。"
-                    }
-                }
-                for acc in accounts {
-                    {
-                        let is_default = default_id.as_deref() == Some(acc.snda_id.as_str());
-                        let set_default_id = acc.snda_id.clone();
-                        let delete_id = acc.snda_id.clone();
-                        let confirm_id = acc.snda_id.clone();
-                        let confirming = confirm_delete.read().as_deref() == Some(acc.snda_id.as_str());
-                        let status = account_status(acc.can_auto_login());
-                        // 旧配置可能存的是数字 ID；展示时尽量换成名称
-                        let area_label = acc.area.as_ref().map(|value| {
-                            state
-                                .areas
-                                .read()
-                                .iter()
-                                .find(|a| a.area_name == *value || a.area_id == *value)
-                                .map(|a| a.area_name.clone())
-                                .unwrap_or_else(|| value.clone())
-                        });
-                        rsx! {
-                            div {
-                                key: "{acc.snda_id}",
-                                style: "box-sizing: border-box; flex: 1 1 240px; min-width: 0; padding: 20px; border: 1px solid {t.border}; border-radius: 8px; background: {t.card_bg};",
-                                div { style: "font-size: 16px; font-weight: 600; color: {t.text}; overflow-wrap: anywhere;", "{acc.display_name()}" }
-                                if acc.username.is_some() {
-                                    div { style: "margin-top: 6px; color: {t.text_secondary}; font-size: 12px; overflow-wrap: anywhere;", "SDO ID：{acc.snda_id}" }
-                                }
-                                if let Some(area) = &area_label {
-                                    div { style: "margin-top: 8px; color: {t.text_secondary}; font-size: 12px;", "默认大区：{area}" }
-                                }
-                                div { style: "margin-top: 12px; color: {t.text_secondary}; font-size: 12px; line-height: 1.6;", "{status}" }
-                                div {
-                                    style: "display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; align-items: center;",
-                                    SmallButton {
-                                        label: if is_default { "默认" } else { "设为默认" },
-                                        disabled: is_default,
-                                        onclick: move |_| {
-                                            let mut cfg = auth::load(&auth::config_path());
-                                            if let Some(acc) = cfg.find(&set_default_id) {
-                                                cfg.default_account = Some(acc.display_name().to_string());
-                                            }
-                                            match auth::save(&auth::config_path(), &cfg) {
-                                                Ok(()) => {
-                                                    state.auth_cfg.set(cfg);
-                                                    state.status.set("默认账号已更新".into());
-                                                }
-                                                Err(e) => state.status.set(format!("保存账号配置失败: {e}")),
-                                            }
-                                        },
-                                    }
-                                    if confirming {
-                                        DangerButton {
-                                            label: "确认删除",
-                                            onclick: move |_| {
-                                                let mut cfg = auth::load(&auth::config_path());
-                                                cfg.remove(&delete_id);
-                                                if let Err(e) = auth::save(&auth::config_path(), &cfg) {
-                                                    state.status.set(format!("保存账号配置失败: {e}"));
-                                                    return;
-                                                }
-                                                state.auth_cfg.set(cfg);
-                                                if state.selected_account.read().as_deref() == Some(delete_id.as_str()) {
-                                                    state.selected_account.set(None);
-                                                }
-                                                confirm_delete.set(None);
-                                                state.status.set("账号已从本机移除".into());
-                                            },
-                                        }
-                                        SmallButton { label: "取消", onclick: move |_| confirm_delete.set(None) }
-                                    } else {
-                                        DangerButton { label: "删除", onclick: move |_| confirm_delete.set(Some(confirm_id.clone())) }
-                                    }
-                                }
-                                if confirming {
-                                    div { style: "margin-top: 12px; font-size: 12px; color: {t.text_secondary};", "只移除本机记录，不会注销盛趣账号。" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+impl App {
+    pub(super) fn accounts_page(&self) -> Element<'_, Msg> {
+        let enabled = !self.critical_busy() && !self.modal_open();
+        let default = self.auth.default_account().map(|a| a.snda_id.as_str());
+        let mut body = column![
+            row![
+                heading("账号管理", 20),
+                space().width(Fill),
+                btn("添加账号", enabled.then_some(Msg::AddAccount), true)
+            ]
+            .align_y(iced::Alignment::Center),
+            text("管理本机保存的账号。启动游戏时会使用已有凭据自动登录。")
+                .size(13)
+                .color(MUTED)
+        ]
+        .spacing(16);
+        if self.auth.accounts.is_empty() {
+            body = body.push(section(
+                "还没有保存的账号",
+                text("点击「添加账号」开始登录。").color(MUTED),
+            ));
         }
+        for pair in self.auth.accounts.chunks(2) {
+            let mut cards = row![].spacing(16);
+            for account in pair {
+                let mut content = column![heading(account.display_name(), 16)].spacing(6);
+                if account.username.is_some() {
+                    content = content.push(
+                        text(format!("SDO ID：{}", account.snda_id))
+                            .size(12)
+                            .color(MUTED),
+                    );
+                }
+                if let Some(area) = &account.area {
+                    let label = self
+                        .areas
+                        .iter()
+                        .find(|a| a.area_id == *area || a.area_name == *area)
+                        .map(|a| a.area_name.as_str())
+                        .unwrap_or(area);
+                    content =
+                        content.push(text(format!("默认大区：{label}")).size(12).color(MUTED));
+                }
+                let is_default = default == Some(account.snda_id.as_str());
+                content = content
+                    .push(
+                        text(account_status(account.can_auto_login()))
+                            .size(12)
+                            .color(MUTED),
+                    )
+                    .push(
+                        row![
+                            btn(
+                                if is_default { "默认" } else { "设为默认" },
+                                (enabled && !is_default)
+                                    .then(|| Msg::Default(account.snda_id.clone())),
+                                false
+                            ),
+                            button(text("删除").size(12))
+                                .padding([8, 12])
+                                .on_press_maybe(
+                                    enabled.then(|| Msg::Delete(account.snda_id.clone()))
+                                )
+                                .style(danger)
+                        ]
+                        .spacing(8),
+                    );
+                cards = cards.push(card(content));
+            }
+            body = body.push(cards);
+        }
+        body.into()
     }
-}
-
-fn cancel_task(mut task: Signal<Option<Task>>) {
-    if let Some(task) = task.write().take() {
-        task.cancel();
-    }
-}
-
-fn start_qr(mut state: AppState, mut qr_state: Signal<QrState>, mut qr_task: Signal<Option<Task>>) {
-    cancel_task(qr_task);
-    let Some(launcher) = state.launcher.read().clone() else {
-        qr_state.set(QrState::Failed("启动器尚未初始化完成".into()));
-        return;
-    };
-    qr_state.set(QrState::Loading);
-    let task = spawn(async move {
-        match launcher.request_qr_code().await {
-            Ok(session) => {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(session.image_data());
-                qr_state.set(QrState::Waiting(b64));
-                match session.wait_for_scan(None).await {
-                    Ok(token) => state.on_login_success(token),
-                    Err(e) => qr_state.set(QrState::Failed(format!("{e}"))),
-                }
-            }
-            Err(e) => qr_state.set(QrState::Failed(format!("{e}"))),
-        }
-    });
-    qr_task.set(Some(task));
-}
-
-/// 最后挂载到应用根容器，不受账号页面滚动区裁剪。
-#[component]
-pub fn AddAccountDialog() -> Element {
-    let mut state = use_context::<AppState>();
-    let t = (state.theme)();
-    let mut method = use_signal(|| LoginMethod::Qr);
-    let mut qr_state = use_signal(|| QrState::Idle);
-    let qr_task = use_signal(|| None::<Task>);
-    let mut push_state = use_signal(|| PushState::Idle);
-    let mut push_task = use_signal(|| None::<Task>);
-    let push_account = use_signal(String::new);
-    let pwd_account = use_signal(String::new);
-    let mut pwd_password = use_signal(String::new);
-    let mut pwd_task = use_signal(|| None::<Task>);
-    let mut pwd_busy = use_signal(|| false);
-    let mut pwd_error = use_signal(|| None::<String>);
-
-    // 打开扫码 tab 自动请求二维码；初始化完成后也会自动重试准备。
-    use_effect(move || {
-        let ready = state.launcher.read().is_some();
-        if method() == LoginMethod::Qr && ready {
-            start_qr(state, qr_state, qr_task);
-        }
-    });
-    use_drop(move || {
-        cancel_task(qr_task);
-        cancel_task(push_task);
-        cancel_task(pwd_task);
-    });
-
-    let mut close_dialog = move || {
-        cancel_task(qr_task);
-        cancel_task(push_task);
-        cancel_task(pwd_task);
-        pwd_password.set(String::new());
-        state.adding_account.set(false);
-    };
-    let mut switch_method = move |next: LoginMethod| {
-        if method() == next {
+    pub(super) fn persist_auth(
+        &mut self,
+        change: AuthChange,
+        login: Option<u64>,
+        selected: Option<String>,
+    ) {
+        if self.critical_busy() {
+            self.status = "请等待当前任务完成后修改账号".into();
             return;
         }
-        cancel_task(qr_task);
-        cancel_task(push_task);
-        cancel_task(pwd_task);
-        qr_state.set(QrState::Idle);
-        push_state.set(PushState::Idle);
-        pwd_busy.set(false);
-        pwd_password.set(String::new());
-        pwd_error.set(None);
-        method.set(next);
-    };
-    let start_push = move |_: MouseEvent| {
-        let account = push_account.read().trim().to_string();
-        if account.is_empty() {
-            push_state.set(PushState::Failed("请输入账号".into()));
-            return;
-        }
-        let Some(launcher) = state.launcher.read().clone() else {
-            push_state.set(PushState::Failed("启动器尚未初始化完成".into()));
+        self.auth_busy = true;
+        backend::save_auth(&self.runtime, self.bus.clone(), change, login, selected);
+    }
+    pub(super) fn persist_login(&mut self) {
+        let Some(token) = self.login.pending_token.clone() else {
             return;
         };
-        cancel_task(push_task);
-        push_state.set(PushState::Loading);
-        let task = spawn(async move {
-            match launcher.request_push_login(&account).await {
-                Ok(session) => {
-                    push_state.set(PushState::Waiting(session.serial_num().map(str::to_string)));
-                    match session.wait_for_confirm(None).await {
-                        Ok(token) => state.on_login_success(token),
-                        Err(e) => push_state.set(PushState::Failed(format!("{e}"))),
-                    }
-                }
-                Err(e) => push_state.set(PushState::Failed(format!("{e}"))),
-            }
-        });
-        push_task.set(Some(task));
-    };
-    let start_password = move |_: MouseEvent| {
-        if pwd_busy() {
+        if self.critical_busy() {
+            self.login.error = Some("请等待当前任务完成后重试保存账号".into());
+            self.login.phase = LoginPhase::Failed;
             return;
         }
-        let account = pwd_account.read().trim().to_string();
-        let password = pwd_password.read().clone();
-        if account.is_empty() || password.is_empty() {
-            pwd_error.set(Some("请输入账号和密码".into()));
+        self.login.phase = LoginPhase::Saving;
+        self.login.error = None;
+        let area = self.selected_area().map(|a| a.area_name);
+        let selected = Some(token.snda_id.clone());
+        self.persist_auth(
+            AuthChange::Add(token, area),
+            Some(self.login.task.generation),
+            selected,
+        );
+    }
+    pub(super) fn start_login(&mut self) {
+        if self.login.phase == LoginPhase::Saving {
             return;
         }
-        let Some(launcher) = state.launcher.read().clone() else {
-            pwd_error.set(Some("启动器尚未初始化完成".into()));
+        self.login.task.cancel();
+        self.login.error = None;
+        self.login.qr = None;
+        self.login.pending_token = None;
+        self.login.serial = None;
+        let Some(launcher) = self.launcher.clone() else {
+            self.login.phase = LoginPhase::Idle;
             return;
         };
-        pwd_busy.set(true);
-        pwd_error.set(None);
-        let task = spawn(async move {
-            match launcher.login_password(&account, &password).await {
-                Ok(token) => {
-                    pwd_password.set(String::new());
-                    state.on_login_success(token);
-                }
-                Err(e) => pwd_error.set(Some(format!("{e}"))),
-            }
-            pwd_busy.set(false);
-        });
-        pwd_task.set(Some(task));
-    };
-
-    rsx! {
-        div {
-            style: "position: absolute; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(0, 0, 0, 0.35);",
-            onclick: move |event: MouseEvent| event.stop_propagation(),
-            onkeydown: move |event: KeyboardEvent| {
-                if event.key() == Key::Escape {
-                    close_dialog();
-                    event.stop_propagation();
-                }
-            },
-            div {
-                role: "dialog",
-                tabindex: "-1",
-                onmounted: move |event| async move {
-                    // 先把键盘焦点移入弹窗，确保 Escape 可以立即关闭。
-                    let _ = event.set_focus(true).await;
+        let account = self.login.username.trim().to_string();
+        if self.login.method != LoginMethod::Qr && account.is_empty() {
+            self.login.error = Some("请输入账号".into());
+            self.login.phase = LoginPhase::Failed;
+            return;
+        }
+        if self.login.method == LoginMethod::Password && self.login.password.is_empty() {
+            self.login.error = Some("请输入密码".into());
+            self.login.phase = LoginPhase::Failed;
+            return;
+        }
+        let method = self.login.method;
+        let password = Zeroizing::new(std::mem::take(&mut self.login.password));
+        let generation = self.login.task.generation;
+        let bus = self.bus.clone();
+        self.login.phase = LoginPhase::Requesting;
+        self.login.task.handle = Some(self.runtime.spawn(async move {
+            let result = match method {
+                LoginMethod::Qr => match launcher.request_qr_code().await {
+                    Ok(session) => {
+                        bus.send(Event::Qr(generation, session.image_data().to_vec()));
+                        session.wait_for_scan(None).await
+                    }
+                    Err(e) => Err(e),
                 },
-                "aria-modal": "true",
-                "aria-labelledby": "add-account-title",
-                style: "box-sizing: border-box; display: flex; flex-direction: column; gap: 20px; width: 440px; max-width: 100%; max-height: 100%; overflow-y: auto; padding: 24px; border: 1px solid {t.border}; border-radius: 8px; background: {t.card_bg}; color: {t.text};",
-                div {
-                    style: "display: flex; align-items: center; justify-content: space-between; gap: 12px;",
-                    h2 { id: "add-account-title", style: "margin: 0; font-size: 18px; font-weight: 600;", "添加账号" }
-                    GhostButton { label: "关闭", onclick: move |_| close_dialog() }
-                }
-                div {
-                    role: "group",
-                    "aria-label": "登录方式",
-                    style: "display: flex; gap: 4px; padding: 4px; border-radius: 6px; background: {t.active_bg};",
-                    for (value, label) in [(LoginMethod::Qr, "叨鱼扫码登录"), (LoginMethod::Push, "叨鱼推送登录"), (LoginMethod::Password, "密码登录")] {
-                        {
-                            let active = method() == value;
-                            let bg = if active { t.card_bg } else { "transparent" };
-                            let fg = if active { t.text } else { t.text_secondary };
-                            rsx! {
-                                button {
-                                    r#type: "button",
-                                    "aria-pressed": active,
-                                    style: "display: flex; align-items: center; justify-content: center; flex: 1 1 0; min-width: 0; padding: 8px 4px; border: none; border-radius: 4px; background: {bg}; color: {fg}; font-size: 13px; text-align: center; cursor: pointer;",
-                                    onclick: move |_| switch_method(value),
-                                    "{label}"
-                                }
-                            }
-                        }
+                LoginMethod::Push => match launcher.request_push_login(&account).await {
+                    Ok(session) => {
+                        bus.send(Event::Push(
+                            generation,
+                            session.serial_num().map(str::to_owned),
+                        ));
+                        session.wait_for_confirm(None).await
                     }
+                    Err(e) => Err(e),
+                },
+                LoginMethod::Password => launcher.login_password(&account, &password).await,
+            };
+            bus.send(Event::Login(generation, result.map_err(|e| e.to_string())));
+        }));
+    }
+    pub(super) fn login_view(&self) -> Element<'_, Msg> {
+        let saving = self.login.phase == LoginPhase::Saving;
+        let busy = matches!(
+            self.login.phase,
+            LoginPhase::Requesting | LoginPhase::Waiting
+        );
+        let selected = match self.login.method {
+            LoginMethod::Qr => 0,
+            LoginMethod::Push => 1,
+            LoginMethod::Password => 2,
+        };
+        let mut content = column![
+            row![
+                heading("添加账号", 18),
+                space().width(Fill),
+                btn("关闭", (!saving).then_some(Msg::CloseLogin), false)
+            ]
+            .align_y(iced::Alignment::Center),
+            segments(
+                "method",
+                &["叨鱼扫码登录", "叨鱼推送登录", "密码登录"],
+                selected,
+                !saving
+            )
+        ]
+        .spacing(20);
+        if let Some(error) = &self.login.error {
+            content = content.push(text(error).size(13).color(RED));
+        }
+        if self.login.pending_token.is_some() {
+            content = content
+                .push(
+                    text(if saving {
+                        "登录成功，正在保存账号…"
+                    } else {
+                        "登录成功，但保存失败。修复文件权限后可重试，无需重新扫码。"
+                    })
+                    .color(MUTED),
+                )
+                .push(btn(
+                    "重试保存账号",
+                    (!saving).then_some(Msg::RetrySave),
+                    true,
+                ));
+        } else if self.login.method == LoginMethod::Qr {
+            if let Some(qr) = &self.login.qr {
+                content = content
+                    .push(container(image(qr.clone()).width(220).height(220)).center_x(Fill))
+                    .push(
+                        text("使用叨鱼 App 扫码并确认，5 分钟内有效。")
+                            .size(13)
+                            .color(MUTED),
+                    );
+            } else {
+                content = content.push(
+                    text(if self.launcher.is_none() {
+                        "正在初始化登录服务…"
+                    } else if busy {
+                        "正在获取二维码…"
+                    } else {
+                        "请刷新二维码重试"
+                    })
+                    .color(MUTED),
+                );
+            }
+            content = content.push(btn(
+                "刷新二维码",
+                (self.launcher.is_some() && self.login.phase != LoginPhase::Requesting)
+                    .then_some(Msg::Login),
+                false,
+            ));
+        } else {
+            content = content.push(
+                column![
+                    text("账号").size(13),
+                    input("username", &self.login.username, "", !busy && !saving)
+                ]
+                .spacing(6),
+            );
+            if self.login.method == LoginMethod::Password {
+                content = content.push(
+                    column![
+                        text("密码").size(13),
+                        input("password", &self.login.password, "", !busy && !saving)
+                    ]
+                    .spacing(6),
+                );
+            }
+            if self.login.phase == LoginPhase::Waiting && self.login.method == LoginMethod::Push {
+                if let Some(serial) = &self.login.serial {
+                    content = content.push(heading(format!("验证序号：{serial}"), 20));
                 }
-                match method() {
-                    LoginMethod::Qr => rsx! {
-                        div {
-                            style: "display: flex; flex-direction: column; align-items: center; gap: 16px;",
-                            match &*qr_state.read() {
-                                QrState::Idle => rsx! { p { style: "color: {t.text_secondary}; font-size: 13px;", "正在初始化登录服务…" } },
-                                QrState::Loading => rsx! { p { style: "color: {t.text_secondary}; font-size: 13px;", "正在获取二维码…" } },
-                                QrState::Waiting(b64) => rsx! {
-                                    div {
-                                        style: "background: #fff; padding: 12px; border-radius: 6px;",
-                                        img { src: "data:image/png;base64,{b64}", alt: "叨鱼登录二维码", style: "display: block; width: 220px; height: 220px;" }
-                                    }
-                                    div { style: "color: {t.text_secondary}; font-size: 13px; line-height: 1.6; text-align: center;", "使用叨鱼 App 扫码并确认，5 分钟内有效。" }
-                                },
-                                QrState::Failed(e) => rsx! { ErrorRow { message: "{e}" } },
-                            }
-                            GhostButton {
-                                label: "刷新二维码",
-                                disabled: matches!(&*qr_state.read(), QrState::Loading) || state.launcher.read().is_none(),
-                                onclick: move |_| start_qr(state, qr_state, qr_task),
-                            }
-                        }
+                content = content.push(
+                    text("请在叨鱼 App 中核对序号并确认，30 秒内有效。")
+                        .size(13)
+                        .color(MUTED),
+                );
+            }
+            if busy {
+                content = content
+                    .push(
+                        text(if self.login.method == LoginMethod::Push {
+                            "正在等待推送确认…"
+                        } else {
+                            "正在登录…"
+                        })
+                        .color(MUTED),
+                    )
+                    .push(btn("取消本次登录", Some(Msg::CancelLogin), false));
+            } else {
+                content = content.push(btn(
+                    if self.login.method == LoginMethod::Push {
+                        "发送推送"
+                    } else {
+                        "登录并添加"
                     },
-                    LoginMethod::Push => rsx! {
-                        div {
-                            style: "display: flex; flex-direction: column; gap: 12px;",
-                            match &*push_state.read() {
-                                PushState::Idle | PushState::Failed(_) => rsx! {
-                                    if let PushState::Failed(e) = &*push_state.read() { ErrorRow { message: "{e}" } }
-                                    label {
-                                        style: "display: flex; flex-direction: column; gap: 8px; color: {t.text}; font-size: 13px;",
-                                        "账号"
-                                        TextInput { value: push_account }
-                                    }
-                                    ActionButton { label: "发送推送", onclick: start_push }
-                                },
-                                PushState::Loading => rsx! { p { style: "color: {t.text_secondary}; font-size: 13px;", "正在发送推送…" } },
-                                PushState::Waiting(serial) => rsx! {
-                                    if let Some(serial) = serial {
-                                        div { style: "font-size: 20px; font-weight: 600; color: {t.text};", "验证序号：{serial}" }
-                                    }
-                                    p { style: "color: {t.text_secondary}; font-size: 13px; line-height: 1.6;", "请在叨鱼 App 中核对序号并确认，30 秒内有效。" }
-                                    GhostButton {
-                                        label: "取消推送",
-                                        onclick: move |_| {
-                                            cancel_task(push_task);
-                                            push_state.set(PushState::Idle);
-                                        },
-                                    }
-                                },
-                            }
-                        }
-                    },
-                    LoginMethod::Password => rsx! {
-                        div {
-                            style: "display: flex; flex-direction: column; gap: 16px;",
-                            if let Some(e) = &*pwd_error.read() { ErrorRow { message: "{e}" } }
-                            label {
-                                style: "display: flex; flex-direction: column; gap: 8px; color: {t.text}; font-size: 13px;",
-                                "账号"
-                                TextInput { value: pwd_account }
-                            }
-                            label {
-                                style: "display: flex; flex-direction: column; gap: 8px; color: {t.text}; font-size: 13px;",
-                                "密码"
-                                PasswordInput { value: pwd_password }
-                            }
-                            ActionButton {
-                                label: if pwd_busy() { "登录中…" } else { "登录并添加" },
-                                disabled: pwd_busy(),
-                                onclick: start_password,
-                            }
-                            div { style: "color: {t.text_secondary}; font-size: 12px;", "密码只用于本次登录，不会保存到本机。" }
-                        }
-                    },
-                }
+                    self.launcher.is_some().then_some(Msg::Login),
+                    true,
+                ));
+            }
+            if self.login.method == LoginMethod::Password {
+                content = content.push(
+                    text("密码只用于本次登录，不会保存到本机。")
+                        .size(12)
+                        .color(MUTED),
+                );
             }
         }
+        card(scrollable(content).height(iced::Length::Shrink))
+            .max_width(440)
+            .into()
     }
-}
-
-#[component]
-pub fn Section(
-    title: &'static str,
-    /// 标题右侧的平台/范围提示（如「Linux / macOS」），None 不显示。
-    #[props(default)]
-    badge: Option<&'static str>,
-    children: Element,
-) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    rsx! {
-        div {
-            style: "background: {t.card_bg}; border: 1px solid {t.border}; border-radius: 8px; padding: 20px;",
-            // 不用 flex 行放标题+标签：blitz 对 flex 内文本项的主轴尺寸测量不可靠，
-            // 即使窗口很宽也可能按很小的宽度换行，而且容器高度仍按单行计算，
-            // 第二行会压到下面的内容上。块级堆叠让标题按容器全宽排版，换行自然撑高。
-            div {
-                style: "margin-bottom: 12px;",
-                h3 { style: "margin: 0; font-size: 15px; font-weight: 500; color: {t.text};", "{title}" }
-                if let Some(badge) = badge {
-                    div {
-                        style: "display: inline-block; margin-top: 6px; padding: 1px 8px; border: 1px solid {t.border}; border-radius: 999px; background: {t.active_bg}; color: {t.text_secondary}; font-size: 11px; line-height: 18px; white-space: nowrap;",
-                        "{badge}"
-                    }
-                }
-            }
-            {children}
+    pub(super) fn delete_view(&self) -> Element<'_, Msg> {
+        card(
+            column![
+                heading("移除本机账号？", 18),
+                text("只移除本机记录，不会注销盛趣账号。").color(MUTED),
+                row![
+                    btn("取消", Some(Msg::Escape), false),
+                    btn(
+                        "确认删除",
+                        (!self.critical_busy()).then_some(Msg::ConfirmDelete),
+                        true
+                    )
+                ]
+                .spacing(8)
+            ]
+            .spacing(20),
+        )
+        .max_width(400)
+        .into()
+    }
+    pub(super) fn change_login_method(&mut self, n: usize) {
+        if self.login.phase == LoginPhase::Saving {
+            return;
+        }
+        self.login.reset();
+        self.login.method = match n {
+            0 => LoginMethod::Qr,
+            1 => LoginMethod::Push,
+            _ => LoginMethod::Password,
+        };
+        if self.login.method == LoginMethod::Qr {
+            self.start_login();
         }
     }
-}
-
-#[component]
-pub fn ActionButton(
-    label: String,
-    onclick: EventHandler<MouseEvent>,
-    #[props(default)] disabled: bool,
-) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    // 禁用态用中性灰，而不是把主按钮整体降透明度（后者看起来仍像可点）。
-    let bg = if disabled {
-        t.progress_track
-    } else {
-        t.primary_bg
-    };
-    let fg = if disabled {
-        t.text_secondary
-    } else {
-        t.primary_fg
-    };
-    let cursor = if disabled { "default" } else { "pointer" };
-    rsx! {
-        button {
-            r#type: "button",
-            disabled,
-            style: "padding: 8px 16px; border: none; border-radius: 6px; background: {bg}; color: {fg}; font-size: 14px; font-weight: 500; cursor: {cursor};",
-            onclick: move |e| { if !disabled { onclick.call(e); } },
-            "{label}"
-        }
+    pub(super) fn password_input(&mut self, mut value: String) {
+        self.login.password.zeroize();
+        std::mem::swap(&mut self.login.password, &mut value);
+        value.zeroize();
     }
 }
-
-#[component]
-pub fn GhostButton(
-    label: &'static str,
-    onclick: EventHandler<MouseEvent>,
-    #[props(default)] disabled: bool,
-) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    let opacity = if disabled { "0.5" } else { "1" };
-    let cursor = if disabled { "default" } else { "pointer" };
-    rsx! {
-        button {
-            r#type: "button",
-            disabled,
-            style: "padding: 8px 16px; border: 1px solid {t.border}; border-radius: 6px; background: transparent; color: {t.text_secondary}; font-size: 13px; cursor: {cursor}; flex-shrink: 0; opacity: {opacity};",
-            onclick: move |e| { if !disabled { onclick.call(e); } },
-            "{label}"
-        }
-    }
-}
-
-#[component]
-fn SmallButton(
-    label: String,
-    onclick: EventHandler<MouseEvent>,
-    #[props(default)] disabled: bool,
-) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    let bg = if disabled { t.active_bg } else { "transparent" };
-    let cursor = if disabled { "default" } else { "pointer" };
-    rsx! {
-        button {
-            r#type: "button",
-            disabled,
-            style: "padding: 6px 10px; border: 1px solid {t.border}; border-radius: 6px; background: {bg}; color: {t.text_secondary}; font-size: 12px; cursor: {cursor};",
-            onclick: move |e| { if !disabled { onclick.call(e); } },
-            "{label}"
-        }
-    }
-}
-
-#[component]
-fn DangerButton(label: &'static str, onclick: EventHandler<MouseEvent>) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    rsx! {
-        button {
-            r#type: "button",
-            style: "padding: 6px 10px; border: 1px solid {t.danger_border}; border-radius: 6px; background: transparent; color: {t.danger}; font-size: 12px; cursor: pointer;",
-            onclick: move |e| onclick.call(e),
-            "{label}"
-        }
-    }
-}
-
-#[component]
-pub fn ErrorRow(message: String) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    rsx! { p { style: "color: {t.danger}; font-size: 13px; margin: 4px 0;", "{message}" } }
-}
-
-#[component]
-pub fn TextInput(#[props(default)] placeholder: String, value: Signal<String>) -> Element {
-    rsx! { InputField { placeholder, value, password: false } }
-}
-
-#[component]
-pub fn PasswordInput(#[props(default)] placeholder: String, value: Signal<String>) -> Element {
-    rsx! { InputField { placeholder, value, password: true } }
-}
-
-/// Blitz 暂不绘制原生 placeholder；仅原生端补一个不接收点击的提示层。
-/// 输入值始终保持真实值，不能把提示文字塞进 value（尤其是密码框）。
-#[component]
-fn InputField(placeholder: String, value: Signal<String>, password: bool) -> Element {
-    let t = (use_context::<AppState>().theme)();
-    let show_hint =
-        cfg!(not(target_arch = "wasm32")) && !placeholder.is_empty() && value.read().is_empty();
-    rsx! {
-        div {
-            style: "position: relative; display: flex; flex: 1; min-width: 0;",
-            // 提示位于透明 input 后面，input 通过直接兄弟间的 z-index 保持在上层；
-            // 原生端即便忽略 pointer-events，命中测试仍落在真实输入框上。
-            if show_hint {
-                div {
-                    "aria-hidden": "true",
-                    style: "position: absolute; left: 13px; right: 13px; top: 0; bottom: 0; display: flex; align-items: center; pointer-events: none; overflow: hidden; color: {t.text_secondary}; font-size: 14px; line-height: 20px;",
-                    "{placeholder}"
-                }
-            }
-            input {
-                r#type: if password { "password" } else { "text" },
-                style: "position: relative; z-index: 1; box-sizing: border-box; flex: 1; min-width: 0; width: 100%; padding: 8px 12px; border: 1px solid {t.input_border}; border-radius: 6px; background: transparent; color: {t.text}; font-size: 14px; line-height: 20px;",
-                placeholder: "{placeholder}",
-                "aria-label": (!placeholder.is_empty()).then(|| placeholder.clone()),
-                value: "{value}",
-                oninput: move |e| value.set(e.value()),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::account_status;
-
+    use super::*;
     #[test]
-    fn saved_credentials_are_not_presented_as_a_verified_session() {
+    fn credentials_are_not_presented_as_verified_session() {
         assert_eq!(account_status(true), "已保存自动登录凭据，启动时验证");
         assert_eq!(account_status(false), "未保存自动登录凭据，请重新添加账号");
     }
