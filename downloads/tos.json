@@ -4,31 +4,31 @@
   "channels": {
     "stable": null,
     "dev": {
-      "version": "dev-466cf4a-9-1",
+      "version": "dev-4953d6c-10-1",
       "tag": "dev-build",
-      "commit": "466cf4a0a0ecb0f197dcae70aebfc72dc3fd80e6",
-      "build": 9,
+      "commit": "4953d6c159082d64660c5412142b686b3b179c4e",
+      "build": 10,
       "published_at": "2026-11-10T13:08:20Z",
       "assets": {
         "linux-x86_64": {
-          "filename": "eorzea-app-dev-466cf4a-9-1-linux-x86_64.tar.gz",
-          "url": "https://azurice-shadow.tos-cn-beijing.volces.com/eorzea/objects/sha256/31/4101c99f4d06f55f15823b06ca1968929d415dfe8128bdb9b6d8cc641232ca",
-          "sha256": "314101c99f4d06f55f15823b06ca1968929d415dfe8128bdb9b6d8cc641232ca",
-          "size": 7560839,
+          "filename": "eorzea-app-dev-4953d6c-10-1-linux-x86_64.tar.gz",
+          "url": "https://azurice-shadow.tos-cn-beijing.volces.com/eorzea/objects/sha256/73/2038802a2c31a40e7b1a9b3cc005132c73c6c699f4857bddc0cecee2121f92",
+          "sha256": "732038802a2c31a40e7b1a9b3cc005132c73c6c699f4857bddc0cecee2121f92",
+          "size": 7742932,
           "experimental": false
         },
         "macos-aarch64": {
-          "filename": "eorzea-app-dev-466cf4a-9-1-macos-aarch64.dmg",
-          "url": "https://azurice-shadow.tos-cn-beijing.volces.com/eorzea/objects/sha256/91/8169ed1ee03d9bdf8bec5465c7b3ef4ab9a3fa651bfdcd4b189a6a7eb3fe3d",
-          "sha256": "918169ed1ee03d9bdf8bec5465c7b3ef4ab9a3fa651bfdcd4b189a6a7eb3fe3d",
-          "size": 6209543,
+          "filename": "eorzea-app-dev-4953d6c-10-1-macos-aarch64.dmg",
+          "url": "https://azurice-shadow.tos-cn-beijing.volces.com/eorzea/objects/sha256/5e/a1d5c7bdb864645c6bc2a5ab2f8ab4e745ccf5a189c2dd9250d299dfbf5126",
+          "sha256": "5ea1d5c7bdb864645c6bc2a5ab2f8ab4e745ccf5a189c2dd9250d299dfbf5126",
+          "size": 6371378,
           "experimental": true
         },
         "windows-x86_64": {
-          "filename": "eorzea-app-dev-466cf4a-9-1-windows-x86_64.zip",
-          "url": "https://azurice-shadow.tos-cn-beijing.volces.com/eorzea/objects/sha256/2a/a26c7ccfc996c1257d5b890b50a6d29d3523dd0413e8104315d62f58559902",
-          "sha256": "2aa26c7ccfc996c1257d5b890b50a6d29d3523dd0413e8104315d62f58559902",
-          "size": 6100975,
+          "filename": "eorzea-app-dev-4953d6c-10-1-windows-x86_64.zip",
+          "url": "https://azurice-shadow.tos-cn-beijing.volces.com/eorzea/objects/sha256/ba/b473cb48990131ddcbc7f8b6fa068bfb5e931923ed4e0e1c9b708b178d864b",
+          "sha256": "bab473cb48990131ddcbc7f8b6fa068bfb5e931923ed4e0e1c9b708b178d864b",
+          "size": 6306355,
           "experimental": false
         }
       }
