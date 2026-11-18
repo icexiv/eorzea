@@ -174,7 +174,7 @@ eoz areas
 检查内容：
 
 - `.ver` 版本文件存在且非空（ffxiv + ex1..5；异常记为 **Warning**）
-- 关键文件存在：`game/ffxiv_dx11.exe`、`sdo/sdologin/sdologinentry64.dll`（缺失记为 **Missing**）
+- 游戏主程序 `game/ffxiv_dx11.exe` 存在（缺失记为 **Missing**）。仅 `[launch].method = "sdo_dll"` 时检查 shim、原版 `.sdo.dll` 的存在、x64 PE 导出及 shim 摘要；Injector 途径不因缺登录 DLL 报错，其组件在启动准备时校验
 - 每个 sqpack 仓库（`game/sqpack/ffxiv` + `exN`）：`.win32.dat*`/`.win32.index*` 的大小、`SqPack` 魔数、header size（异常记为 **Corrupt**）
 - `game/movie` 目录存在（缺失记为 **Warning**）
 
@@ -211,15 +211,15 @@ eoz areas
 登录并启动游戏。CLI 和 GUI 均调用核心库 `Launcher::launch_account(LaunchRequest, on_event)`，界面只提供账号、大区、游戏目录、Wine/Dalamud 选项并展示进度，不缓存游戏 ticket。执行阶段如下（每步失败都有明确报错；启用 Dalamud 时**不会静默降级**）：
 
 1. **大区与游戏预检**：大区按 `--area` → 指定账号（缺省默认账号）的 `area` → 旧 `config.toml` 的 `area` → 大区列表第一个解析；名称错误、游戏可执行文件缺失、未完成更新或 Wine 不支持的游戏路径均在登录前报错。
-2. **Dalamud 准备**：启用时按需补齐 release / runtime / assets（下载显示进度条）；失败则**报错且不启动游戏**，提示用 `--no-dalamud` 本次跳过。必须在登录之前完成，否则失败会让一次性 session key 作废。
+2. **启动途径准备**：`--launch-method` 覆盖 `[launch].method`，默认 `injector`。Injector 途径准备版本匹配的国服 Injector / ArgFixer 与所需 .NET，只有加载 Dalamud 时额外准备 assets；`--no-dalamud` 仍保留登录修补。`sdo_dll` 途径从已有原版或官方启动器 ZIP 准备原版＋shim，校验长度、摘要与 x64 导出，不部署整套 SDO；该途径不加载 Dalamud，但不会改写 `[dalamud].enabled`；只有显式同时传 `--dalamud` 才在登录前报错。准备失败不自动回退。
 3. **登录**：每次读取 `auth.toml` 中 `--account` 或默认账号的最新 session key，重新认证并换取游戏 ticket；启动认证使用文件锁防止同时轮换，保存时合并账号配置的最新变更。新 key 保存失败或发现凭据冲突则中止启动。剩余有效期会显示在终端。新账号或 key 过期时先用 `eoz auth login qr` / `password` 登录。
-4. **登录 DLL 检查**：确保 `sdo/sdologin/sdologinentry64.dll` 是 ottercorp 修改版——缺失则下载（缓存于 `~/.eorzea/tools/`），是原版则备份为 `sdologinentry64.sdo.dll` 后替换。
+4. **登录 DLL 预检**：仅 `sdo_dll` 途径在创建进程前复查两个入口；已有有效原版 `.sdo.dll` 不覆盖，无效备份报错要求检查。Injector 途径不部署或读取这两个入口。
 5. **Wine 准备**：按 `startup_type` 解析 Wine（必要时自动下载）→ `wine64 --version` 探针 → 确保 prefix 存在且为 64 位（详见 [`wine.md`](wine.md)）。
 6. **DXVK 检查**：`dxvk.enabled` 时确保 DXVK 已装入 prefix（未装则下载安装）。
 7. **组装启动参数与环境**：`-AppID=100001900 -AreaID=… Dev.LobbyHost01=… DEV.TestSID=<ticket> XL.SndaId=…` 等；环境变量由配置生成（`WINEDLLOVERRIDES`、esync/fsync、DXVK、`[env]` 自定义项等）。
 8. **启动**：
-   - 启用 Dalamud 且已就绪 → 路径经 `winepath` 转换，通过 `Dalamud.Injector.exe` 启动并等待其报告游戏 PID（30 秒超时）。
-   - 未启用（`--no-dalamud` 或配置关闭）→ 直接 `wine64 ffxiv_dx11.exe …` 启动。
+   - `injector` → 路径经 `winepath` 转换，通过 `Dalamud.Injector.exe` 启动并等待其报告游戏 PID（30 秒超时）；不加载 Dalamud 时加 `--without-dalamud`，仍执行 ArgFixer。
+   - `sdo_dll` → 直接通过 Wine（Windows 为原生进程）启动游戏，由 shim 提供票据。
 
 成功后输出游戏 PID 与日志文件路径；失败时打印首行摘要并提示 `-v` 看完整输出。
 
@@ -229,9 +229,11 @@ eoz launch                          # 默认账号自动登录 + 启动（推荐
 eoz launch --account 你的账号        # 指定已保存账号
 eoz launch --wine /opt/wine/bin/wine64   # 本次覆盖 Wine（仅 Linux/macOS）
 eoz launch --dalamud / --no-dalamud      # 本次覆盖 [dalamud].enabled
+eoz launch --launch-method injector --no-dalamud # 使用登录修补，不加载插件框架
+eoz launch --launch-method sdo_dll --no-dalamud  # 独立准备官方原版 + shim
 ```
 
-选项：`--game-path`、`--area`、`--account`、`--dalamud` / `--no-dalamud`；`--wine` 仅 Linux/macOS 构建中存在（Windows 原生启动不使用 Wine）。
+选项：`--game-path`、`--area`、`--account`、`--launch-method injector|sdo_dll`、`--dalamud` / `--no-dalamud`；`--wine` 仅 Linux/macOS 构建中存在（Windows 原生启动不使用 Wine）。
 
 ---
 

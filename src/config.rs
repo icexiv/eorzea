@@ -217,6 +217,76 @@ impl DownloadSettings {
     }
 }
 
+/// 启动器更新通道；Auto 跟随构建通道，源码构建默认查询 Dev。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LauncherUpdateChannel {
+    #[default]
+    Auto,
+    Stable,
+    Dev,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LauncherUpdateSource {
+    /// 国内镜像优先；请求或清单校验失败时回退 GitHub。
+    #[default]
+    Auto,
+    Mirror,
+    Github,
+}
+
+/// 仅用于启动器本体的版本检查，不影响游戏补丁或 Dalamud。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LauncherUpdateSettings {
+    pub check_on_startup: bool,
+    pub channel: LauncherUpdateChannel,
+    pub source: LauncherUpdateSource,
+}
+
+impl Default for LauncherUpdateSettings {
+    fn default() -> Self {
+        Self {
+            check_on_startup: true,
+            channel: LauncherUpdateChannel::Auto,
+            source: LauncherUpdateSource::Auto,
+        }
+    }
+}
+
+/// 国服登录入口的实现，与是否加载游戏内 Dalamud 分开选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SdoLaunchMethod {
+    /// 使用国服 Injector 的 ArgFixer；关闭 Dalamud 时仍保留登录修补。
+    #[default]
+    Injector,
+    /// 使用官方入口备份 + ottercorp shim，不依赖 Injector/.NET。
+    SdoDll,
+}
+
+impl SdoLaunchMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Injector => "Injector / ArgFixer",
+            Self::SdoDll => "原版 DLL + shim",
+        }
+    }
+
+    /// 该途径是否可以加载游戏内 Dalamud。
+    pub fn loads_dalamud(self) -> bool {
+        self == Self::Injector
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaunchSettings {
+    pub method: SdoLaunchMethod,
+}
+
 /// 整个 `config.toml` 的结构。
 ///
 /// 布局刻意保持扁平：
@@ -226,6 +296,7 @@ impl DownloadSettings {
 ///   `startup_type`/`[dxvk]`/`[env]` 等键（读取旧文件时这些键被忽略）。
 /// - `[dalamud]`：Dalamud 设置 section
 /// - `[download]`：CLI 与 GUI 共用的下载并发设置
+/// - `[launcher_update]`：GUI 启动器更新检查设置
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -234,6 +305,8 @@ pub struct AppConfig {
     /// 旧版全局默认大区（如 `陆行鸟`，也兼容旧数字 ID），CLI 未传 `--area` 时使用。
     pub area: Option<String>,
     pub download: DownloadSettings,
+    pub launch: LaunchSettings,
+    pub launcher_update: LauncherUpdateSettings,
     #[cfg(not(target_os = "windows"))]
     #[serde(default, flatten)]
     pub settings: WineSettings,
@@ -261,6 +334,14 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# eorzea 配置（GUI 与 eoz CLI 共�
 # concurrency = 4
 # min_concurrency = 0 # 非零允许突破预取窗口，可能积压更多缓存
 
+# [launch]
+# method = "injector" # injector / sdo_dll；与 Dalamud 开关独立
+
+# [launcher_update]
+# check_on_startup = true # 仅 GUI 启动器版本检查，不影响游戏或 Dalamud 更新
+# channel = "auto" # auto / stable / dev
+# source = "auto" # auto / mirror / github
+
 # 其余字段（Wine、DXVK、Dalamud、环境变量）及默认值见 docs/config.md。
 # Wine 相关设置包含 startup_type/custom_path/prefix/esync/fsync/msync/gamemode、
 # [dxvk] 与 [env]；Windows 原生启动会忽略它们。
@@ -284,6 +365,14 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# eorzea 配置（GUI 与 eoz CLI 共�
 # [download]
 # concurrency = 4
 # min_concurrency = 0 # 非零允许突破预取窗口，可能积压更多缓存
+
+# [launch]
+# method = "injector" # injector / sdo_dll；与 Dalamud 开关独立
+
+# [launcher_update]
+# check_on_startup = true # 仅 GUI 启动器版本检查，不影响游戏或 Dalamud 更新
+# channel = "auto" # auto / stable / dev
+# source = "auto" # auto / mirror / github
 
 # 其余字段（[dalamud] 等）及默认值见 docs/config.md。
 # 在 GUI 或 `eoz config set` 保存后本文件会被重写，以上注释不会保留。
@@ -446,6 +535,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn launch_method_defaults_roundtrip_and_dalamud_are_independent() {
+        let old: AppConfig = toml::from_str("[dalamud]\nenabled = false").unwrap();
+        assert_eq!(old.launch.method, SdoLaunchMethod::Injector);
+        assert!(old.launch.method.loads_dalamud());
+        let dll: AppConfig = toml::from_str("[launch]\nmethod = 'sdo_dll'").unwrap();
+        assert_eq!(dll.launch.method, SdoLaunchMethod::SdoDll);
+        assert!(!dll.launch.method.loads_dalamud());
+        // Dalamud 开关保留自己的值，切回 Injector 时继续生效。
+        let both: AppConfig =
+            toml::from_str("[launch]\nmethod = 'sdo_dll'\n[dalamud]\nenabled = true").unwrap();
+        assert!(both.dalamud.enabled);
+        assert!(!both.launch.method.loads_dalamud());
+        assert_eq!(
+            toml::from_str::<AppConfig>(&toml::to_string(&dll).unwrap()).unwrap(),
+            dll
+        );
+        assert!(toml::from_str::<AppConfig>("[launch]\nmethod = 'guess'").is_err());
+    }
+
+    #[test]
     fn test_default_settings() {
         let s = WineSettings::default();
         assert_eq!(s.startup_type, WineStartupType::Auto);
@@ -601,6 +710,28 @@ mod tests {
         assert_eq!(toml::from_str::<AppConfig>(&text).unwrap(), app);
         let partial: AppConfig = toml::from_str("[download]\nconcurrency = 8\n").unwrap();
         assert_eq!(partial.download.min_concurrency, 0);
+    }
+
+    #[test]
+    fn launcher_update_settings_are_backwards_compatible_and_roundtrip() {
+        let legacy: AppConfig = toml::from_str("game_path = '/game'\n").unwrap();
+        assert_eq!(legacy.launcher_update, LauncherUpdateSettings::default());
+        let config: AppConfig = toml::from_str(
+            "[launcher_update]\ncheck_on_startup = false\nchannel = 'stable'\nsource = 'github'\n",
+        )
+        .unwrap();
+        assert!(!config.launcher_update.check_on_startup);
+        assert_eq!(
+            config.launcher_update.channel,
+            LauncherUpdateChannel::Stable
+        );
+        assert_eq!(config.launcher_update.source, LauncherUpdateSource::Github);
+        assert_eq!(
+            toml::from_str::<AppConfig>(&toml::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+        assert!(toml::from_str::<AppConfig>("[launcher_update]\nchannel = 'stabel'\n").is_err());
+        assert!(toml::from_str::<AppConfig>("[launcher_update]\nsource = 'custom'\n").is_err());
     }
 
     #[test]

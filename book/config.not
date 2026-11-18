@@ -47,6 +47,39 @@ concurrency = 8
 min_concurrency = 4
 ```
 
+== 国服启动途径
+
+所有平台使用 `[launch]`，与 `[dalamud].enabled` 分开保存。GUI 设置页「启动」区、主页启动区可切换，主页切换立即写入配置；CLI 用 --launch-method 单次覆盖。
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `launch.method` | 枚举字符串 | "injector" | injector / sdo_dll。缺少此字段也默认使用 Injector。 |
+
+- `injector`：启动前准备国服 Injector / ArgFixer 与所需 .NET，严格检查游戏版本。即使关闭 Dalamud，仍使用 --without-dalamud 执行登录修补；不准备 Dalamud assets、不加载插件框架。更新通道与安装根目录复用 dalamud.track / dalamud.install_root。
+- `sdo_dll`：准备官方原版 DLL 与 ottercorp shim 后直接运行游戏，不要求 Injector/.NET。缺失原版时从官方 ZIP 获取并校验，仅部署两个入口，不复制整套 SDO 登录器。已有有效原版备份不覆盖；无效备份报错，不静默删除。该途径不加载 Dalamud，但不会改写 dalamud.enabled，切回 Injector 后仍按原设置生效。
+
+途径冲突或组件准备失败都在重新认证之前报错，不消费本次游戏票据，不自动切换另一条途径。--no-dalamud 不是跳过所选途径的准备或游戏版本检查。
+
+```toml
+[launch]
+method = "injector"
+
+[dalamud]
+enabled = false
+```
+
+== 启动器版本检查
+
+`[launcher_update]` 只由 GUI 使用，CLI 不自动联网检查。手动检查使用已保存设置并绕过缓存；启动检查后台执行，失败不阻断登录或游戏启动。
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `launcher_update.check_on_startup` | 布尔值 | true | 启动 GUI 时检查一次，成功清单按来源缓存 6 小时。 |
+| `launcher_update.channel` | 枚举字符串 | "auto" | auto 跟随发行构建通道，源码/Nix 默认 Dev；可指定 stable / dev。未发布时不切换到其他通道。 |
+| `launcher_update.source` | 枚举字符串 | "auto" | auto 国内镜像优先，失败回退 GitHub；mirror / github 仅使用指定来源。 |
+
+检查只获取版本清单，不下载或替换程序。Nix 包由包管理器更新；不提供覆盖 Nix store 的选项。游戏补丁与 Dalamud 更新不受此设置影响。
+
 == Wine（仅 Linux / macOS）
 
 Wine 字段直接平铺在顶层，*没有 [wine] 表*。Windows 原生启动不使用这些字段，读取时忽略，保存时移除；Windows 的 CLI 也不接受这些配置键。
@@ -96,7 +129,7 @@ WINEDEBUG = "-all"
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `dalamud.enabled` | 布尔值 | false | 启用 Dalamud；CLI --dalamud / --no-dalamud 或 GUI 主页开关可单次覆盖。 |
+| `dalamud.enabled` | 布尔值 | false | 启用 Dalamud（仅 Injector 途径）；设置页「启动」区与主页开关写同一字段，CLI --dalamud / --no-dalamud 可单次覆盖。 |
 | `dalamud.load_method` | 字符串枚举 | "entrypoint" | entrypoint：入口点改写；dllinject：远程 DLL 注入；aclonly：只做兼容修复，不加载 Dalamud。 |
 | `dalamud.delay_initialize_ms` | u32 | 0 | 注入后延迟初始化的毫秒数。 |
 | `dalamud.no_plugins` | 布尔值 | false | 安全模式，禁用全部插件。 |

@@ -15,6 +15,8 @@ use std::{
 use tokio::runtime::Runtime;
 
 pub enum Event {
+    LauncherChecked(u64, Result<crate::updates::CheckResult, String>),
+    LinkOpened(Result<(), String>),
     Config(AppConfig, AuthConfig),
     Launcher(Result<Arc<Launcher>, String>),
     Areas(Result<Vec<SdoArea>, String>),
@@ -29,6 +31,8 @@ pub enum Event {
         result: Result<AuthConfig, String>,
     },
     SettingsSaved(Result<AppConfig, String>),
+    LaunchMethodSaved(Result<AppConfig, String>),
+    DalamudEnabledSaved(Result<AppConfig, String>),
     Folder(Option<PathBuf>),
     GamePath(u64, bool),
     Checked(u64, Result<(Vec<PatchListEntry>, bool), String>),
@@ -36,6 +40,26 @@ pub enum Event {
     LaunchStatus(u64, String),
     AuthReload(AuthConfig),
     Launched(u64, Result<u32, String>),
+}
+pub fn check_launcher(
+    runtime: &Runtime,
+    bus: Bus,
+    generation: u64,
+    info: crate::build_info::BuildInfo,
+    settings: eorzea::config::LauncherUpdateSettings,
+    force: bool,
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn(async move {
+        let result = crate::updates::check(&info, &settings, force).await;
+        bus.send(Event::LauncherChecked(generation, result));
+    })
+}
+pub fn open_link(runtime: &Runtime, bus: Bus, url: String) {
+    runtime.spawn_blocking(move || {
+        bus.send(Event::LinkOpened(
+            open::that_detached(url).map_err(|e| format!("打开链接失败: {e}")),
+        ));
+    });
 }
 #[derive(Default)]
 pub struct LocalSummary {
@@ -230,6 +254,37 @@ pub fn save_settings(runtime: &Runtime, bus: Bus, draft: Draft) {
         bus.send(Event::SettingsSaved(result));
     });
 }
+/// 主页切换启动途径：只写入途径，不改动 Dalamud 开关。
+/// 不提交设置页里尚未保存的其他草稿。
+pub fn save_launch_method(runtime: &Runtime, bus: Bus, method: eorzea::config::SdoLaunchMethod) {
+    runtime.spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let path = config::settings_path();
+            let mut config = config::load_app_default();
+            config.launch.method = method;
+            config::save_app(&path, &config).map_err(|e| e.to_string())?;
+            Ok(config)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        bus.send(Event::LaunchMethodSaved(result));
+    });
+}
+/// 主页启用/关闭 Dalamud：只写入该开关，不改动启动途径。
+pub fn save_dalamud_enabled(runtime: &Runtime, bus: Bus, enabled: bool) {
+    runtime.spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let path = config::settings_path();
+            let mut config = config::load_app_default();
+            config.dalamud.enabled = enabled;
+            config::save_app(&path, &config).map_err(|e| e.to_string())?;
+            Ok(config)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        bus.send(Event::DalamudEnabledSaved(result));
+    });
+}
 pub fn check(runtime: &Runtime, bus: Bus, generation: u64, root: PathBuf, area: Option<SdoArea>) {
     runtime.spawn(async move {
         let result = async {
@@ -284,6 +339,7 @@ pub struct Launch {
     pub areas: Vec<SdoArea>,
     pub wine: WineSettings,
     pub dalamud: bool,
+    pub launch_method: eorzea::config::SdoLaunchMethod,
 }
 pub fn launch(
     runtime: &Runtime,
@@ -304,6 +360,7 @@ pub fn launch(
                     areas: input.areas,
                     wine: &input.wine,
                     dalamud: Some(input.dalamud),
+                    launch_method: Some(input.launch_method),
                 },
                 |event| {
                     let status = match event {

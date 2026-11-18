@@ -74,7 +74,9 @@
 - [x] **`XL.DcTraveler` 参数**：当 `dc_travel_port > 0` 时添加
 - [x] **端到端验证**：`sdo_login` 示例完成 QR 扫码 → `sso_login` → ticket 获取 → 启动参数构造
 - [x] **`sdologinentry64.dll` 替换**：`EnsureLoginEntry()` — 自动从 ottercorp GitHub 下载修改版 DLL，缓存到 `~/.eorzea/tools/`，复制到 `{gamePath}/sdo/sdologinentry64.dll`
-  - [ ] **空目录安装的原版登录 DLL 预检与来源**：空目录更新只部署 shim，缺少原版 `.sdo.dll` 时实测游戏报 `Can not load`。已确认官方 `ff.autopatch.sdo.com/v3launcher/` 索引及 ZIP 来源；需验证部署规则，实现原版校验、启动预检及 `verify`。整套 SDO 组件和 SDK 是否必需尚未验证；补齐它们未解决本次卡住，不应据此扩大安装依赖。上游同样未补齐原版，CN 跳过 boot 更新。详见 [`docs/notes/sdo-installation.md`](docs/notes/sdo-installation.md)。
+  - [x] **确认无原版仍可启动的原因**：实际 Injector 在恢复游戏前调用随包 `FfxivArgLauncher.ArgFixer.Fix()`，替换 SDO 登录函数并从启动参数填写 ticket/账号 ID，不经过 shim。REA CIL、固定提交源码及同次 Injector 日志相互印证。`--without-dalamud` 判断在修补之后，修补不依赖游戏内 Dalamud。详见 [DLL 与启动路径证据](docs/notes/sdologinentry64_analysis.md)。
+  - [x] **解耦国服启动修补与 Dalamud 开关**：`launch.method = injector|sdo_dll`（默认 Injector），CLI/GUI 独立选择。Injector 关闭 Dalamud 仍通过 `--without-dalamud` 保留 ArgFixer、版本门控和 .NET 准备，跳过 assets；DLL 途径独立准备官方原版 + 固定摘要 shim，保护已有备份，仅条件预检。准备/冲突错误均先于账号认证，不自动回退。官方 ZIP 下载校验与隔离目录幂等部署测试通过，见 [`docs/notes/sdo-installation.md`](docs/notes/sdo-installation.md)。
+  - [ ] **双途径实际游戏验证**：在用户许可下，对最小安装分别验证 Injector 不加载 Dalamud、Injector 加载 Dalamud、原版 + shim 从标题到角色列表/进入游戏；当前验证覆盖静态结构、官方完整下载和隔离部署，不代表 Wine 运行时兼容性已验证。
   - **已修复（2026-08-06）**：`is_ottercorp_dll()` 原先按 UTF-8 搜索 `"ottercorp"`，但 PE version info 中该字符串是 UTF-16LE 存储，检测恒为 false → 每次启动都把当前 DLL 备份覆盖 `.sdo.dll`，第二次启动即永久覆盖原版备份，修改版 shim 转发到自身导致游戏内 5003「帐号认证发生了错误」。现已同时匹配 ASCII/UTF-16LE 两种编码，且已有 `.sdo.dll` 备份时不再覆盖
 
 ### P2-2 参数加密 (`ArgumentBuilder.cs` → `BuildEncrypted`)
@@ -212,7 +214,11 @@
 - [ ] **`SdoArea` 反序列化测试**：用真实 serverlist_new.js 内容做 fixture 测试
 - [ ] **SE OAuth HTML 解析测试**：用 fixture HTML 验证 `_STORED_` 和 `login=auth,ok,...` 提取
 - [x] **macOS 发行构建 runner**：Release workflow 固定使用受支持的 `macos-15` Apple Silicon runner，目标保持 `aarch64-apple-darwin`；macOS 构建失败不阻塞其他平台的策略不变。
-- [x] **GUI/CLI 独立发行附件**：所有平台均按 `eorzea-app`（GUI）与 `eoz`（CLI）直接发布独立可执行文件，不制作合并包或压缩包；Windows 附件带 `.exe`，Linux/macOS 无扩展名。开发版和稳定版说明均包含程序用途、执行权限与下载方式，开发版发布后清理旧附件名。
+- [x] **GUI/CLI 独立发行附件**：Windows 分别提供 App/CLI ZIP，Linux 分别提供 tar.gz，macOS 为 App DMG 与 CLI tar.gz；包内可执行文件名固定。GitHub/TOS 独立清单包含 GUI 各平台的版本、commit、构建号、大小与 SHA-256，Dev 文件名包含构建身份，不静默复用下载 URL。见 [`docs/releases.md`](docs/releases.md)。
+- [x] **启动器构建身份与更新检查**：CI 注入版本、通道、commit、run/attempt 和分发来源；App 设置提供启动/手动检查、stable/dev、国内镜像/GitHub 回退与发布说明。请求有超时/大小限制，成功清单按来源缓存 6 小时；不下载发行包，不影响游戏操作。稳定版按 SemVer、Dev 按 run/attempt 比较，无法排序的源码构建不误报降级；底栏提示新版，`--version` 无窗口输出构建身份。
+- [x] **Nix App/CLI 打包与仅检查策略**：flake 提供 `eorzea-app`、`eorzea-cli`、默认 App 包与运行入口，Linux App 包装运行库并安装桌面入口/图标；编译时 `nix-package` 和 Nix 来源标记、`/nix/store/` 路径兜底，仅显示版本检查与包管理器升级指引，不执行自安装。Wine/FHS 适配独立，使用说明见 [`docs/nix.md`](docs/nix.md)。
+- [ ] **启动器自动下载安装**：普通 Windows/Linux 发行包仍需手动安装；需签名更新元数据、校验/暂存、退出后的替换、恢复路径与关键任务/未保存设置协调。macOS 应用包替换及签名需单独验收；Nix 包必须继续禁止下载安装启动器本体。
+- [ ] **Nix macOS 原生验收**：需验证 App/CLI 原生构建、动态库、字体与启动；Linux 的无窗口检查不等同于 macOS 可运行或 Wine 可用。
 
 ### P4-2.5 GUI UX 修正
 
@@ -224,6 +230,7 @@
 - [x] **启动按钮居中与悬停反馈**：「启动游戏」「启动中…」在 56px 按钮内显式水平和垂直居中；主/次/弱/危险按钮、分段按钮及导航补充 hover/pressed 状态。可用按钮悬停改变表面/边框/文字，禁用按钮不高亮、不触发按下动画；无窗口布局和实际像素回归防止再次偏移或样式无变化。
 - [x] **全局底边栏与日志抽屉**：36px 底栏左侧显示编译时启动器版本，右侧显示最新真实日志，单行预览/全文提示及日志级别色；按钮展开全局可滚动、可复制日志抽屉，切页保留展开和滚动状态，主页不再重复放日志卡。操作结果独立显示 6 秒提示，新的日志和过期的旧提示不会覆盖它。
 - [x] **日志抽屉动画裁剪**：位移/缩放后的子控件接收逆变换后的固定裁剪视口，嵌套文字、选区和按钮图层不能越过底栏。CPU 像素回归在控件创建后建立合成时钟基准，复用控件树及动画帧布局，覆盖收起、完全关闭、重开和中途反转，并在普通/150% 缩放下逐像素检查底栏及动画结束帧。
+- [x] **日志滚动边缘叠字**：本地补丁修正 `iced_tiny_skia` 编辑器将视口边界误当作字形边界、跳过裁剪的问题，阻止半行文字溢出到上下留白并在局部重绘后残留；无窗口像素测试覆盖滚动、换行及局部重绘。
 - [x] **Iced 轻量动效与层级精修**：使用内置 `Animation`，抽屉 200ms ease-out 位移、按钮 100ms 按下反馈；状态保存在控件内，仅过渡时请求绘制，不发送逐帧应用消息、不使主页面每帧重排，完成后停止请求。`EORZEA_REDUCED_MOTION=1` 关闭动效。摘要卡改用轻底色，保留白色/zinc、现有导航与业务布局；未引入动画/组件库或 GPU features。调查见 [`docs/gui-motion.md`](docs/gui-motion.md)，真实平台流畅度仍待获准测试。
 
 - [x] **GUI/CLI 共用账号启动流程与票据生命周期**：两者统一调用 `Launcher::launch_account(LaunchRequest, on_event)`，核心库负责游戏预检 → Dalamud 准备 → 读取最新凭据 → 自动登录 → 保存轮换 key → 创建游戏进程。GUI 移除 `AppState.tokens`，每次启动及失败重试都重新换取 ticket；界面只提供参数并展示事件。回归测试覆盖同一 Launcher 连续重试、默认账号/名称/ID 选择、认证失败及预检失败不启动。
@@ -290,7 +297,7 @@
 - [ ] **Windows 设备指纹**：见 P0-1（当前 fallback 为 `unknown-<USERNAME>`）
 - [ ] **发布版日志**：`windows_subsystem = "windows"` 后 GUI 无控制台，`tracing` 只写 stderr → release 版没有日志可查；需要文件日志（如滚动写到 `~/.eorzea/logs/`）
 - [ ] **配置目录**：当前 `~/.eorzea`（`C:\Users\<用户>\.eorzea`），与 C# 的 `%APPDATA%\XIVLauncher` 不同，也不读取 C# 旧配置；是否改用 `dirs::config_dir()` 待定
-- [ ] **安装包**：`v*` tag 会触发 `.github/workflows/release.yml`，构建 Linux/Windows/macOS 的 `eorzea-app` + `eoz` 压缩包并发布 GitHub Release（macOS 任务暂设 `continue-on-error`，未真机验证）；手动 Run workflow 更新 Development build pre-release，自动移动 `dev-build` tag 并替换附件，可选平台失败时移除其旧包（不随 push `main` 构建）。仍没有 Windows 安装器（MSI/NSIS）与代码签名，用户需解压后运行 `eorzea-app.exe`。
+- [ ] **安装器与代码签名**：`v*` tag 发布版本包，push `main` 或从 `main` 手动发布更新 Dev；PR 只构建不发布。Windows 目前为独立 App/CLI ZIP，仍无 MSI/NSIS 与代码签名，用户需解压后运行；macOS DMG 为实验性、未签名/公证且未真机验证。见 [`docs/releases.md`](docs/releases.md)。
 - [x] **配置按平台拆分**：Windows 的 `AppConfig` 不含 Wine 字段（`#[cfg(not(windows))]`），`config.toml` 不写 `startup_type`/`custom_path`/`prefix`/`esync`/`fsync`/`msync`/`gamemode`/`[dxvk]`/`[env]`，`eoz config set` 对 Wine 键报「未知配置键」；读取 Linux/macOS 写出的配置时忽略这些键，`eoz config list` 只输出当前平台字段；首次运行模板也按平台区分（2026-10-30）
 
 ---

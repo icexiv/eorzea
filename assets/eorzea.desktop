@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Eorzea
+Name[zh_CN]=Eorzea 国服启动器
+Comment=FFXIV SDO launcher
+Exec=eorzea-app
+Icon=eorzea
+Terminal=false
+Categories=Game;
+StartupNotify=true

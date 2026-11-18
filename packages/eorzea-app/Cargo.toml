@@ -5,6 +5,10 @@ description = "Eorzea（FFXIV 国服启动器）Iced 软件渲染 GUI"
 authors = ["azurice"]
 edition = "2024"
 
+[features]
+# 包管理器分发：编译时标记，不能通过运行时环境变量变成便携版。
+nix-package = []
+
 [dependencies]
 iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "tokio", "wayland", "x11", "image-without-codecs", "svg", "web-colors", "crisp", "advanced"] }
 fontdb = "0.23"
@@ -18,10 +22,14 @@ reqwest = { version = "0.12", features = ["rustls-tls", "gzip"], default-feature
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+open = "5"
+tempfile = "3"
 
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
 
 [dev-dependencies]
-tempfile = "3"
 tiny-skia = "0.11"

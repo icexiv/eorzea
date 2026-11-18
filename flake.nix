@@ -1,5 +1,5 @@
 {
-  description = "rust";
+  description = "Eorzea FFXIV launcher and CLI";
 
   # nixConfig = {
   #   extra-substituters = [
@@ -29,6 +29,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       crane,
       notist,
@@ -85,16 +86,88 @@
           alsa-lib # wine 声音（ALSA）
         ];
         runtimeLibs = lib.optionals pkgs.stdenv.hostPlatform.isLinux (guiSystemLibs ++ wineLibs);
+
+        packageCraneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.latest.default);
+        version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+        revision = self.rev or (self.dirtyRev or "unknown");
+        packageArgs = {
+          src = packageCraneLib.cleanCargoSource ./.;
+          inherit version;
+          pname = "eorzea";
+          strictDeps = true;
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [
+            pkgs.openssl
+          ]
+          ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.fontconfig ]
+          ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.apple-sdk ];
+          # Limit memory use even on hosts exposing many cores.
+          CARGO_BUILD_JOBS = "2";
+        };
+        mkPackage =
+          package: binary:
+          let
+            args = packageArgs // {
+              cargoExtraArgs =
+                "-p ${package}" + lib.optionalString (package == "eorzea-app") " --features nix-package";
+            };
+          in
+          packageCraneLib.buildPackage (
+            args
+            // {
+              pname = package;
+              # A CLI-only build must not compile Iced or the GUI dependency chain.
+              cargoArtifacts = packageCraneLib.buildDepsOnly args;
+              doCheck = false; # Tests are run separately, without a display or user credentials.
+              EORZEA_DISTRIBUTION = "nix";
+              EORZEA_BUILD_VERSION = "${version}-nix.${builtins.substring 0 12 revision}";
+              EORZEA_BUILD_COMMIT = if self ? rev then self.rev else "";
+              # Nix/source revisions do not have a GitHub Actions run number; never invent one.
+              EORZEA_BUILD_CHANNEL = "dev";
+              nativeBuildInputs = packageArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
+              postInstall = lib.optionalString (package == "eorzea-app") (
+                lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+                  wrapProgram "$out/bin/eorzea-app" \
+                    --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath guiSystemLibs}" \
+                    --prefix PATH : "${lib.makeBinPath [ pkgs.xdg-utils ]}"
+                  install -Dm644 ${./assets/eorzea.desktop} "$out/share/applications/eorzea.desktop"
+                  install -Dm644 ${./assets/eorzea.svg} "$out/share/icons/hicolor/scalable/apps/eorzea.svg"
+                ''
+              );
+              meta = {
+                description = if package == "eorzea-app" then "FFXIV SDO launcher" else "FFXIV SDO launcher CLI";
+                homepage = "https://github.com/icexiv/eorzea";
+                mainProgram = binary;
+                platforms = lib.platforms.linux ++ lib.platforms.darwin;
+              };
+            }
+          );
+        app = mkPackage "eorzea-app" "eorzea-app";
+        cli = mkPackage "eorzea-cli" "eoz";
       in
       {
         packages.notist = notist.packages.${system}.default;
+        packages.eorzea-app = app;
+        packages.eorzea-cli = cli;
+        packages.default = app;
+        apps.default = {
+          type = "app";
+          program = "${app}/bin/eorzea-app";
+        };
+        apps.eorzea-app = {
+          type = "app";
+          program = "${app}/bin/eorzea-app";
+        };
+        apps.eorzea-cli = {
+          type = "app";
+          program = "${cli}/bin/eoz";
+        };
         devShells.default = craneLib.devShell {
-          packages =
-            with pkgs; [
-              notist.packages.${system}.default
-              gh
-              pkg-config
-            ];
+          packages = with pkgs; [
+            notist.packages.${system}.default
+            gh
+            pkg-config
+          ];
           buildInputs =
             runtimeLibs
             ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [

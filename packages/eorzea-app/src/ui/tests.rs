@@ -74,6 +74,97 @@ fn drafts_and_operation_lifetime_are_root_owned() {
     app.accept(Event::Updated(generation - 1, Ok(0)));
     assert_eq!(app.operation, Operation::Updating);
 }
+
+#[test]
+fn launcher_check_is_independent_of_game_operation_and_rejects_late_results() {
+    let mut app = app();
+    app.operation = Operation::Launching;
+    app.status = "正在准备游戏".into();
+    let _ = app.update(Msg::CheckLauncher);
+    assert!(app.launcher_update.checking);
+    assert_eq!(app.operation, Operation::Launching);
+    assert!(!app.draft.dirty(&app.config));
+    let generation = app.launcher_update.task.generation;
+    let _ = app.update(Msg::CheckLauncher);
+    assert_eq!(app.launcher_update.task.generation, generation);
+    let _ = app.update(Msg::Page(Tab::Settings));
+    app.accept(Event::LauncherChecked(generation - 1, Err("stale".into())));
+    assert!(app.launcher_update.checking);
+    assert!(app.launcher_update.result.is_none());
+    app.accept(Event::LauncherChecked(generation, Err("offline".into())));
+    assert!(!app.launcher_update.checking);
+    assert_eq!(app.operation, Operation::Launching);
+    assert_eq!(app.status, "正在准备游戏");
+    assert!(app.notice.is_none());
+    draw(&app, 620.);
+}
+
+#[test]
+fn launcher_update_draft_uses_existing_save_and_restore_flow() {
+    let mut app = app();
+    let _ = app.update(Msg::Toggle("launcher_check", false));
+    let _ = app.update(Msg::Segment("launcher_channel", 1));
+    let _ = app.update(Msg::Segment("launcher_source", 2));
+    assert!(app.draft.dirty(&app.config));
+    assert!(app.config.launcher_update.check_on_startup);
+    let saved = app.draft.apply(&app.config).unwrap();
+    assert!(!saved.launcher_update.check_on_startup);
+    assert_eq!(
+        saved.launcher_update.channel,
+        eorzea::config::LauncherUpdateChannel::Stable
+    );
+    let _ = app.update(Msg::Restore);
+    assert!(!app.draft.dirty(&app.config));
+    // Saving an opt-out invalidates in-flight results without starting another check.
+    app.launcher_update.checking = true;
+    let generation = app.launcher_update.task.generation;
+    app.accept(Event::SettingsSaved(Ok(saved)));
+    app.accept(Event::LauncherChecked(
+        generation,
+        Err("old settings".into()),
+    ));
+    assert!(!app.launcher_update.checking);
+    assert!(app.launcher_update.result.is_none());
+    assert!(!app.config.launcher_update.check_on_startup);
+}
+
+#[test]
+fn nix_update_states_draw_without_windows_downloads_or_url_opening() {
+    use crate::updates::{CheckResult, Comparison, Source};
+    let mut app = app();
+    app.tab = Tab::Settings;
+    app.build_info.distribution = crate::build_info::Distribution::Nix;
+    let release: crate::updates::Release = serde_json::from_value(serde_json::json!({
+        "version": "v0.2.0", "tag": "v0.2.0", "build": 9,
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "published_at": "2026-11-17T00:00:00Z", "assets": {}
+    }))
+    .unwrap();
+    for comparison in [
+        Comparison::Newer,
+        Comparison::Different,
+        Comparison::Current,
+        Comparison::Older,
+    ] {
+        app.launcher_update.result = Some(Ok(CheckResult {
+            release: Some(release.clone()),
+            channel: crate::build_info::Channel::Stable,
+            comparison,
+            platform_available: false,
+            source: Source::Mirror,
+            cached: true,
+        }));
+        assert_eq!(
+            app.launcher_update_available(),
+            comparison == Comparison::Newer
+        );
+        for width in [620., 720.] {
+            draw(&app, width);
+        }
+    }
+    assert!(app.rx.try_recv().is_err());
+    assert!(app.launcher_update.task.handle.is_none());
+}
 #[test]
 fn cancelled_login_rejects_late_qr_push_and_result() {
     let mut app = app();
@@ -520,9 +611,70 @@ fn operation_notice_is_independent_of_logs_and_old_expiry() {
     );
 }
 
+fn render_page(app: &App, name: &str) {
+    let mut renderer = iced::Renderer::new(iced::Font::DEFAULT, 14.into());
+    let mut element = app.view();
+    let mut tree = Tree::new(element.as_widget());
+    let size = iced::Size::new(720., 860.);
+    let viewport = iced::Rectangle::with_size(size);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, size),
+    );
+    let mut messages = Vec::new();
+    element.as_widget_mut().update(
+        &mut tree,
+        &iced::Event::Window(iced::window::Event::RedrawRequested(
+            iced::time::Instant::now(),
+        )),
+        Layout::new(&node),
+        mouse::Cursor::Unavailable,
+        &renderer,
+        &mut iced::advanced::clipboard::Null,
+        &mut iced::advanced::Shell::new(&mut messages),
+        &viewport,
+    );
+    element.as_widget().draw(
+        &tree,
+        &mut renderer,
+        &theme(),
+        &renderer::Style::default(),
+        Layout::new(&node),
+        mouse::Cursor::Unavailable,
+        &viewport,
+    );
+    let mut pixels = tiny_skia::Pixmap::new(720, 860).unwrap();
+    let mut mask = tiny_skia::Mask::new(720, 860).unwrap();
+    renderer.draw(
+        &mut pixels.as_mut(),
+        &mut mask,
+        &iced::advanced::graphics::Viewport::with_physical_size(iced::Size::new(720, 860), 1.),
+        &[viewport],
+        iced::Color::WHITE,
+    );
+    assert!(
+        pixels
+            .pixels()
+            .iter()
+            .any(|pixel| pixel.red() < 100 && pixel.green() < 100)
+    );
+    if let Some(directory) = std::env::var_os("EORZEA_TEST_RENDER_DIR") {
+        // The native tiny-skia framebuffer is BGRA for softbuffer; PNG expects RGBA.
+        for pixel in pixels.data_mut().chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        std::fs::create_dir_all(&directory).unwrap();
+        pixels
+            .save_png(std::path::PathBuf::from(directory).join(format!("{name}.png")))
+            .unwrap();
+    }
+}
+
 #[test]
 fn software_rasterization_draws_pixels_without_compositor() {
     let mut app = app();
+    app.config.dalamud.enabled = true;
     app.draft.dalamud.enabled = true;
     for (name, tab, open) in [
         ("Home", Tab::Home, false),
@@ -552,64 +704,17 @@ fn software_rasterization_draws_pixels_without_compositor() {
             ];
         }
         app.log_view.sync(&app.logs);
-        let mut renderer = iced::Renderer::new(iced::Font::DEFAULT, 14.into());
-        let mut element = app.view();
-        let mut tree = Tree::new(element.as_widget());
-        let size = iced::Size::new(720., 860.);
-        let viewport = iced::Rectangle::with_size(size);
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, size),
-        );
-        let mut messages = Vec::new();
-        element.as_widget_mut().update(
-            &mut tree,
-            &iced::Event::Window(iced::window::Event::RedrawRequested(
-                iced::time::Instant::now(),
-            )),
-            Layout::new(&node),
-            mouse::Cursor::Unavailable,
-            &renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut iced::advanced::Shell::new(&mut messages),
-            &viewport,
-        );
-        element.as_widget().draw(
-            &tree,
-            &mut renderer,
-            &theme(),
-            &renderer::Style::default(),
-            Layout::new(&node),
-            mouse::Cursor::Unavailable,
-            &viewport,
-        );
-        let mut pixels = tiny_skia::Pixmap::new(720, 860).unwrap();
-        let mut mask = tiny_skia::Mask::new(720, 860).unwrap();
-        renderer.draw(
-            &mut pixels.as_mut(),
-            &mut mask,
-            &iced::advanced::graphics::Viewport::with_physical_size(iced::Size::new(720, 860), 1.),
-            &[viewport],
-            iced::Color::WHITE,
-        );
-        assert!(
-            pixels
-                .pixels()
-                .iter()
-                .any(|pixel| pixel.red() < 100 && pixel.green() < 100)
-        );
-        if let Some(directory) = std::env::var_os("EORZEA_TEST_RENDER_DIR") {
-            // The native tiny-skia framebuffer is BGRA for softbuffer; PNG expects RGBA.
-            for pixel in pixels.data_mut().chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-            std::fs::create_dir_all(&directory).unwrap();
-            pixels
-                .save_png(std::path::PathBuf::from(directory).join(format!("{name}.png")))
-                .unwrap();
-        }
+        render_page(&app, name);
     }
+    // 原版 DLL 途径：两个页面都不应出现 Dalamud 开关。
+    app.draft.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.config.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.logs_open = false;
+    app.log_view.sync(&app.logs);
+    app.tab = Tab::Home;
+    render_page(&app, "HomeDll");
+    app.tab = Tab::Settings;
+    render_page(&app, "SettingsDll");
 }
 
 fn drawer_frame(
@@ -812,4 +917,155 @@ fn drawer_animation_never_paints_text_selection_or_controls_over_footer() {
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
+}
+
+#[test]
+fn launch_route_selection_keeps_dalamud_off_for_the_dll_route() {
+    let mut app = app();
+    app.tab = Tab::Settings;
+    app.draft.dalamud.enabled = true;
+    let _ = app.update(Msg::Segment("launch_method", 1));
+    assert_eq!(
+        app.draft.launch.method,
+        eorzea::config::SdoLaunchMethod::SdoDll
+    );
+    assert!(
+        app.draft.dalamud.enabled,
+        "切换启动途径不应改动 Dalamud 设置"
+    );
+    let saved = app.draft.apply(&app.config).unwrap();
+    assert_eq!(saved.launch.method, eorzea::config::SdoLaunchMethod::SdoDll);
+    assert!(saved.dalamud.enabled);
+    draw(&app, 720.);
+}
+
+#[test]
+fn dll_route_keeps_the_saved_dalamud_setting_for_the_injector_route() {
+    let mut app = app();
+    app.tab = Tab::Settings;
+    app.draft.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.draft.dalamud.enabled = true;
+    // 两个字段互相独立：该组合可以保存，只是 DLL 途径不加载插件框架。
+    let saved = app.draft.apply(&app.config).unwrap();
+    assert!(saved.dalamud.enabled);
+    draw(&app, 620.);
+}
+
+#[test]
+fn home_route_result_updates_persisted_route_only() {
+    let mut app = app();
+    app.config.dalamud.enabled = true;
+    app.draft.dalamud.enabled = true;
+    app.config.dalamud.enabled = true;
+    let inspection = app.inspection_generation;
+    app.config.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.draft.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.launch_method_pending = Some((
+        eorzea::config::SdoLaunchMethod::SdoDll,
+        eorzea::config::SdoLaunchMethod::Injector,
+    ));
+    let mut saved = app.config.clone();
+    saved.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.bus.send(Event::LaunchMethodSaved(Ok(saved)));
+    let _ = app.update(Msg::Wake);
+    assert_eq!(
+        app.config.launch.method,
+        eorzea::config::SdoLaunchMethod::SdoDll
+    );
+    assert!(app.config.dalamud.enabled);
+    assert!(app.draft.dalamud.enabled);
+    assert!(app.config.dalamud.enabled);
+    assert!(app.launch_method_pending.is_none());
+    assert!(app.notice.is_none(), "切换途径本身不需要额外的 toast");
+    // 该途径不再加载 Dalamud，需要清掉旧的组件状态。
+    assert_eq!(app.inspection_generation, inspection + 1);
+    draw(&app, 720.);
+
+    // 写入失败：恢复到写入前的途径，并给出提示。
+    app.config.launch.method = eorzea::config::SdoLaunchMethod::Injector;
+    app.draft.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.launch_method_pending = Some((
+        eorzea::config::SdoLaunchMethod::SdoDll,
+        eorzea::config::SdoLaunchMethod::Injector,
+    ));
+    app.bus
+        .send(Event::LaunchMethodSaved(Err("配置文件只读".into())));
+    let _ = app.update(Msg::Wake);
+    assert_eq!(
+        app.config.launch.method,
+        eorzea::config::SdoLaunchMethod::Injector
+    );
+    assert_eq!(
+        app.draft.launch.method,
+        eorzea::config::SdoLaunchMethod::Injector
+    );
+    assert!(app.status.contains("切换启动途径失败"));
+    assert!(app.notice.is_some(), "保存失败仍要给出反馈");
+}
+
+#[test]
+fn route_switch_ignores_dalamud_status_when_it_changes_nothing() {
+    let mut app = app();
+    app.config.dalamud.enabled = false;
+    let inspection = app.inspection_generation;
+    app.config.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.draft.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.launch_method_pending = Some((
+        eorzea::config::SdoLaunchMethod::SdoDll,
+        eorzea::config::SdoLaunchMethod::Injector,
+    ));
+    let mut saved = app.config.clone();
+    saved.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+    app.bus.send(Event::LaunchMethodSaved(Ok(saved)));
+    let _ = app.update(Msg::Wake);
+    // 本次都不加载 Dalamud：无需重新探测，界面也就不会闪。
+    assert_eq!(app.inspection_generation, inspection);
+    assert!(app.dalamud.is_none());
+}
+
+#[test]
+fn home_dalamud_switch_persists_and_reverts_on_failure() {
+    let mut app = app();
+    app.config.dalamud.enabled = false;
+    app.draft.dalamud.enabled = false;
+    let inspection = app.inspection_generation;
+    // 点击后立即生效，写入完成只回填同一值。
+    app.config.dalamud.enabled = true;
+    app.draft.dalamud.enabled = true;
+    app.dalamud_pending = Some(false);
+    let mut saved = app.config.clone();
+    app.bus.send(Event::DalamudEnabledSaved(Ok(saved.clone())));
+    let _ = app.update(Msg::Wake);
+    assert!(app.config.dalamud.enabled);
+    assert!(app.draft.dalamud.enabled);
+    assert!(app.dalamud_pending.is_none());
+    // 重新探测一次：加载状态从关到开。
+    assert_eq!(app.inspection_generation, inspection + 1);
+    draw(&app, 620.);
+
+    // 第二次点击：关闭；写入失败时恢复到写入前的 true。
+    app.config.dalamud.enabled = false;
+    app.draft.dalamud.enabled = false;
+    app.dalamud_pending = Some(true);
+    app.bus
+        .send(Event::DalamudEnabledSaved(Err("配置文件只读".into())));
+    let _ = app.update(Msg::Wake);
+    assert!(app.config.dalamud.enabled, "失败时恢复旧值");
+    assert!(app.draft.dalamud.enabled);
+    assert!(app.notice.is_some());
+}
+
+#[test]
+fn dalamud_track_uses_segments_and_keeps_custom_values() {
+    let mut app = app();
+    app.tab = Tab::Settings;
+    app.draft.dalamud.track = "release".into();
+    let _ = app.update(Msg::Segment("track", 1));
+    assert_eq!(app.draft.dalamud.track, "staging");
+    let _ = app.update(Msg::Segment("track", 0));
+    assert_eq!(app.draft.dalamud.track, "release");
+    app.draft.dalamud.track = "custom-track".into();
+    let _ = app.update(Msg::Segment("track", 2));
+    assert_eq!(app.draft.dalamud.track, "custom-track");
+    draw(&app, 620.);
 }

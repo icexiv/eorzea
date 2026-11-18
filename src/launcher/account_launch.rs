@@ -19,6 +19,7 @@ pub struct LaunchRequest<'a> {
     pub areas: Vec<SdoArea>,
     pub wine: &'a WineSettings,
     pub dalamud: Option<bool>,
+    pub launch_method: Option<crate::config::SdoLaunchMethod>,
 }
 
 /// 仅包含展示信息，不向界面暴露可缓存的游戏票据。
@@ -53,6 +54,20 @@ impl Launcher {
         request: LaunchRequest<'_>,
         mut on_event: impl FnMut(LaunchEvent),
     ) -> Result<GameLaunchResult, LauncherError> {
+        self.validate_launch_request(&request)?;
+        let dalamud = self
+            .prepare_launch(
+                request.game_root,
+                request.launch_method,
+                request.dalamud,
+                |phase, done, total| on_event(LaunchEvent::DalamudProgress(phase, done, total)),
+            )
+            .await?;
+        self.launch_account_prepared(request, dalamud, on_event)
+            .await
+    }
+
+    fn validate_launch_request(&self, request: &LaunchRequest<'_>) -> Result<(), LauncherError> {
         let exe = request.game_root.join("game/ffxiv_dx11.exe");
         if crate::game_files::update::has_pending_update(request.game_root) {
             return Err(GameLaunchError::UpdateInProgress.into());
@@ -66,14 +81,17 @@ impl Launcher {
         }
         #[cfg(not(target_os = "windows"))]
         crate::game::validate_wine_game_path(&exe)?;
+        Ok(())
+    }
 
-        // Dalamud 组件准备在自动登录前完成，避免浪费短期票据。
-        let dalamud = self
-            .prepare_dalamud(request.game_root, request.dalamud, |phase, done, total| {
-                on_event(LaunchEvent::DalamudProgress(phase, done, total));
-            })
-            .await?;
-
+    // 准备与凭据轮换分开，以便认证状态测试使用纯内存准备结果而不下载/执行外部产品。
+    async fn launch_account_prepared(
+        &self,
+        request: LaunchRequest<'_>,
+        dalamud: Option<super::GameLaunchConfigDalamud>,
+        mut on_event: impl FnMut(LaunchEvent),
+    ) -> Result<GameLaunchResult, LauncherError> {
+        let exe = request.game_root.join("game/ffxiv_dx11.exe");
         // 两个界面同时启动时，不能同时使用同一个会轮换的 session key。
         let lock = std::fs::OpenOptions::new()
             .read(true)
@@ -144,11 +162,14 @@ impl Launcher {
             remaining_seconds: token.auto_login_max_age,
         });
         on_event(LaunchEvent::Starting {
-            dalamud_version: dalamud.as_ref().and_then(|d| {
-                d.install_dir
-                    .file_name()
-                    .map(|v| v.to_string_lossy().into_owned())
-            }),
+            dalamud_version: dalamud
+                .as_ref()
+                .filter(|d| !d.without_dalamud)
+                .and_then(|d| {
+                    d.install_dir
+                        .file_name()
+                        .map(|v| v.to_string_lossy().into_owned())
+                }),
         });
         self.launch_prepared(
             request.wine,

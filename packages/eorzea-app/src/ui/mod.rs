@@ -1,4 +1,5 @@
 //! Production Iced/tiny-skia UI. Root-owned tasks survive page changes.
+mod app_update;
 mod backend;
 mod footer;
 mod home;
@@ -90,6 +91,10 @@ pub enum Msg {
     Restore,
     Browse,
     RetryAreas,
+    CheckLauncher,
+    ShowLauncherUpdate,
+    ReleaseNotes,
+    NixGuide,
     CloseRequested,
     ConfirmExit,
     CancelExit,
@@ -111,6 +116,8 @@ pub struct App {
     auth: AuthConfig,
     draft: Draft,
     loaded: bool,
+    build_info: crate::build_info::BuildInfo,
+    launcher_update: app_update::State,
     launcher: Option<Arc<Launcher>>,
     tab: Tab,
     areas: Vec<SdoArea>,
@@ -133,7 +140,13 @@ pub struct App {
     path_generation: u64,
     draft_game_found: Option<bool>,
     settings_error: Option<String>,
-    dalamud_this_launch: bool,
+    /// 主页途径切换的写入中标记：避免重复提交，失败时恢复旧值。
+    launch_method_pending: Option<(
+        eorzea::config::SdoLaunchMethod,
+        eorzea::config::SdoLaunchMethod,
+    )>,
+    /// 主页 Dalamud 开关写入中标记：保存失败时恢复旧值。
+    dalamud_pending: Option<bool>,
     inspection_generation: u64,
     local: backend::LocalSummary,
     dalamud_loading: bool,
@@ -174,6 +187,8 @@ impl App {
             auth: AuthConfig::default(),
             draft,
             loaded: false,
+            build_info: crate::build_info::BuildInfo::current(),
+            launcher_update: app_update::State::default(),
             launcher: None,
             tab: Tab::Home,
             areas: Vec::new(),
@@ -196,7 +211,8 @@ impl App {
             path_generation: 0,
             draft_game_found: None,
             settings_error: None,
-            dalamud_this_launch: false,
+            launch_method_pending: None,
+            dalamud_pending: None,
             inspection_generation: 0,
             local: Default::default(),
             dalamud_loading: false,
@@ -248,14 +264,16 @@ impl App {
     }
     fn refresh_summary(&mut self) {
         self.inspection_generation += 1;
-        self.dalamud_loading = self.dalamud_this_launch;
+        let load_dalamud = self.config.launch.method == eorzea::config::SdoLaunchMethod::Injector
+            && self.config.dalamud.enabled;
+        self.dalamud_loading = load_dalamud;
         self.dalamud = None;
         backend::inspect(
             &self.runtime,
             self.bus.clone(),
             self.inspection_generation,
             self.config.clone(),
-            self.dalamud_this_launch,
+            load_dalamud,
         );
     }
     fn choose_account(&mut self, id: String) {
@@ -333,7 +351,6 @@ impl App {
     fn accept(&mut self, event: Event) {
         match event {
             Event::Config(config, auth) => {
-                self.dalamud_this_launch = config.dalamud.enabled;
                 self.tab = if auth.accounts.is_empty() {
                     Tab::Accounts
                 } else if config.game_path.is_none() {
@@ -348,6 +365,9 @@ impl App {
                 self.loaded = true;
                 self.status = "准备就绪".into();
                 self.refresh_summary();
+                if self.config.launcher_update.check_on_startup {
+                    self.start_launcher_check(false);
+                }
             }
             Event::Launcher(result) => match result {
                 Ok(launcher) => {
@@ -465,15 +485,25 @@ impl App {
                 self.settings_busy = false;
                 match result {
                     Ok(config) => {
+                        let update_changed = self.config.launcher_update != config.launcher_update;
                         self.config = config;
                         self.draft = Draft::new(&self.config);
-                        self.dalamud_this_launch = self.config.dalamud.enabled;
                         self.settings_error = None;
                         self.status = "设置已保存".into();
                         self.patches.clear();
                         self.update_progress = None;
                         self.update_message.clear();
                         self.refresh_summary();
+                        if update_changed {
+                            self.launcher_update = app_update::State {
+                                task: std::mem::take(&mut self.launcher_update.task),
+                                ..Default::default()
+                            };
+                            self.launcher_update.task.cancel();
+                            if self.config.launcher_update.check_on_startup {
+                                self.start_launcher_check(false);
+                            }
+                        }
                     }
                     Err(e) => {
                         self.settings_error = Some(e.clone());
@@ -481,6 +511,63 @@ impl App {
                     }
                 }
             }
+            Event::LaunchMethodSaved(result) => {
+                match result {
+                    Ok(config) => {
+                        let (requested, previous) = self
+                            .launch_method_pending
+                            .take()
+                            .unwrap_or((config.launch.method, self.config.launch.method));
+                        let load_before = previous.loads_dalamud() && self.config.dalamud.enabled;
+                        let load_after =
+                            config.launch.method.loads_dalamud() && self.config.dalamud.enabled;
+                        self.config.launch.method = config.launch.method;
+                        self.draft.launch.method = config.launch.method;
+                        self.settings_error = None;
+                        if requested != config.launch.method {
+                            self.status = format!(
+                                "启动途径仍为 {}（配置文件被其他程序修改）",
+                                config.launch.method.label()
+                            );
+                        }
+                        // 只有“是否真的加载 Dalamud”变化时才重新探测，避免整页闪一下。
+                        if load_before != load_after {
+                            self.refresh_summary();
+                        }
+                    }
+                    Err(e) => {
+                        if let Some((_, previous)) = self.launch_method_pending.take() {
+                            self.config.launch.method = previous;
+                            self.draft.launch.method = previous;
+                        }
+                        self.notice_pending = true;
+                        self.settings_error = Some(e.clone());
+                        self.status = format!("切换启动途径失败: {e}");
+                    }
+                }
+            }
+            Event::DalamudEnabledSaved(result) => match result {
+                Ok(config) => {
+                    let previous = self.dalamud_pending.take();
+                    self.config.dalamud.enabled = config.dalamud.enabled;
+                    self.draft.dalamud.enabled = config.dalamud.enabled;
+                    self.settings_error = None;
+                    if previous.is_some_and(|previous| previous != config.dalamud.enabled)
+                        && self.config.launch.method.loads_dalamud()
+                    {
+                        self.refresh_summary();
+                    }
+                }
+                Err(e) => {
+                    if let Some(previous) = self.dalamud_pending.take() {
+                        self.config.dalamud.enabled = previous;
+                        self.draft.dalamud.enabled = previous;
+                    }
+                    self.notice_pending = true;
+                    self.settings_error = Some(e.clone());
+                    self.status = format!("保存 Dalamud 开关失败: {e}");
+                }
+            },
             Event::Folder(path) => {
                 self.folder_busy = false;
                 if let Some(path) = path {
@@ -543,6 +630,19 @@ impl App {
                         format!("启动失败: {e}")
                     }
                 };
+            }
+            Event::LauncherChecked(generation, result)
+                if self.launcher_update.task.accepts(generation) =>
+            {
+                self.launcher_update.checking = false;
+                self.launcher_update.task.handle = None;
+                if let Err(error) = &result {
+                    tracing::debug!(%error, "启动器更新检查失败，不影响游戏启动");
+                }
+                self.launcher_update.result = Some(result);
+            }
+            Event::LinkOpened(result) => {
+                self.launcher_update.link_error = result.err();
             }
             _ => {}
         }
@@ -624,6 +724,25 @@ impl App {
             Msg::Check => self.check_update(),
             Msg::Update => self.run_update(),
             Msg::Launch => self.launch_game(),
+            Msg::CheckLauncher if !self.modal_open() => self.start_launcher_check(true),
+            Msg::ShowLauncherUpdate if !self.modal_open() => self.tab = Tab::Settings,
+            Msg::ReleaseNotes if !self.modal_open() => {
+                if let Some(Ok(result)) = &self.launcher_update.result {
+                    if let Some(release) = &result.release {
+                        backend::open_link(&self.runtime, self.bus.clone(), release.notes_url());
+                    }
+                }
+            }
+            Msg::NixGuide
+                if !self.modal_open()
+                    && self.build_info.distribution == crate::build_info::Distribution::Nix =>
+            {
+                backend::open_link(
+                    &self.runtime,
+                    self.bus.clone(),
+                    crate::updates::NIX_GUIDE.into(),
+                );
+            }
             Msg::Copy => {
                 self.notice_pending = true;
                 let text = crate::logging::format_for_copy(&self.logs);

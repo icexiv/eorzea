@@ -140,6 +140,14 @@ pub fn quiet(_: &Theme, status: button::Status) -> button::Style {
         ..Default::default()
     }
 }
+/// 同一张卡片内的分组线。
+pub fn line<'a>() -> Element<'a, Msg> {
+    container(iced::widget::space::horizontal())
+        .height(1)
+        .width(Fill)
+        .style(divider)
+        .into()
+}
 pub fn card<'a>(body: impl Into<Element<'a, Msg>>) -> iced::widget::Container<'a, Msg> {
     container(body).padding(20).width(Fill).style(panel)
 }
@@ -275,6 +283,7 @@ pub fn segments<'a>(
     selected: usize,
     enabled: bool,
 ) -> Element<'a, Msg> {
+    // 只有登录方式的选项填满整行；启动途径按内容宽度显示。
     let method = id == "method";
     let mut items = row![].spacing(4);
     for (n, label) in labels.iter().enumerate() {

@@ -28,4 +28,8 @@ The SSH key is independent of Market's and the homepage's. Its forced command pe
 
 ## Checks
 
+The App build receives `EORZEA_BUILD_VERSION`, `EORZEA_BUILD_CHANNEL`, `EORZEA_BUILD_COMMIT`, `EORZEA_BUILD_NUMBER`, `EORZEA_BUILD_ATTEMPT` and `EORZEA_DISTRIBUTION` at compile time. Only published builds are marked `portable`; local/PR builds default to source distribution. `eorzea-app --version` prints identity without starting a window. Nix packages enable `nix-package` and are always check-only.
+
+The settings page checks the same source-specific manifests, with bounded HTTPS requests and a six-hour cache; manual checks bypass cache. It never silently switches channels or fetches archive bytes. Stable builds compare SemVer and Dev builds compare workflow run/attempt. Source/Nix builds without ordering metadata report a different upstream build rather than recommending a downgrade. Automatic archive installation, signed update metadata and platform-specific replacement/recovery are not implemented.
+
 Run `python3 -m unittest discover -s scripts/tests -v` for packaging and manifest logic. Workflows are validated with actionlint. Linux, Windows and macOS native builds run in the release matrix; macOS remains optional until real-machine validation and signing are available.
