@@ -114,6 +114,8 @@ pub struct Draft {
     pub game: String,
     pub max: String,
     pub min: String,
+    pub launcher_update: eorzea::config::LauncherUpdateSettings,
+    pub launch: eorzea::config::LaunchSettings,
     pub wine: eorzea::config::WineSettings,
     pub custom: String,
     pub prefix: String,
@@ -139,6 +141,8 @@ impl Draft {
             game: path_string(&config.game_path),
             max: config.download.concurrency.to_string(),
             min: config.download.min_concurrency.to_string(),
+            launcher_update: config.launcher_update.clone(),
+            launch: config.launch.clone(),
             custom: path_string(&wine.custom_path),
             prefix: path_string(&wine.prefix),
             wine,
@@ -158,6 +162,8 @@ impl Draft {
             .parse()
             .map_err(|_| "最少并发需要非负整数")?;
         config.download.validate()?;
+        config.launcher_update = self.launcher_update.clone();
+        config.launch = self.launch.clone();
         #[cfg(not(target_os = "windows"))]
         {
             let s = &mut config.settings;
@@ -199,6 +205,17 @@ pub fn initial_account(auth: &AuthConfig) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn draft_roundtrips_launch_method_independently_of_dalamud() {
+        let config = AppConfig::default();
+        let mut draft = Draft::new(&config);
+        draft.launch.method = eorzea::config::SdoLaunchMethod::SdoDll;
+        draft.dalamud.enabled = true;
+        let saved = draft.apply(&config).unwrap();
+        assert_eq!(saved.launch.method, eorzea::config::SdoLaunchMethod::SdoDll);
+        assert!(saved.dalamud.enabled);
+        assert_eq!(Draft::new(&saved), draft);
+    }
     #[test]
     fn invalid_values_are_dirty_and_cannot_save() {
         let config = AppConfig::default();

@@ -381,6 +381,103 @@ mod tests {
         );
     }
     #[test]
+    fn scrolled_logs_do_not_draw_outside_the_editor() {
+        use iced::advanced::Renderer as _;
+        use iced::advanced::{Layout, layout, mouse, renderer, widget::Tree};
+        let mut view = LogView::default();
+        view.sync(
+            &(0..40)
+                .map(|i| LogEntry {
+                    level: LogLevel::Info,
+                    text: format!("{i:02} abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                        .repeat(3),
+                })
+                .collect::<Vec<_>>(),
+        );
+        for scale in [1., 1.5] {
+            let mut renderer = iced::Renderer::new(iced::Font::DEFAULT, 12.into());
+            let mut tree = Tree::new(view.view().as_widget());
+            let mut clipboard = Clipboard::default();
+            let width = (400. * scale) as u32;
+            let height = (200. * scale) as u32;
+            let mut pixels = tiny_skia::Pixmap::new(width, height).unwrap();
+            let mut mask = tiny_skia::Mask::new(width, height).unwrap();
+            let graphics_viewport = iced::advanced::graphics::Viewport::with_physical_size(
+                iced::Size::new(width, height),
+                scale,
+            );
+            for frame in 0..5 {
+                dispatch(
+                    &mut view,
+                    &mut tree,
+                    &renderer,
+                    &iced::Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: mouse::ScrollDelta::Lines { x: 0., y: -1. },
+                    }),
+                    mouse::Cursor::Available(iced::Point::new(100., 80.)),
+                    &mut clipboard,
+                );
+                let mut element = view.view();
+                tree.diff(element.as_widget());
+                let node = element
+                    .as_widget_mut()
+                    .layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(400., 151.)),
+                    )
+                    .move_to(iced::Point::new(0., 20.));
+                let viewport = iced::Rectangle::with_size(iced::Size::new(400., 200.));
+                renderer.reset(viewport);
+                element.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &theme(),
+                    &renderer::Style::default(),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &viewport,
+                );
+                let damage = if frame == 0 {
+                    viewport
+                } else {
+                    iced::Rectangle::new(iced::Point::new(0., 20.), iced::Size::new(400., 151.))
+                };
+                renderer.draw(
+                    &mut pixels.as_mut(),
+                    &mut mask,
+                    &graphics_viewport,
+                    &[damage],
+                    iced::Color::WHITE,
+                );
+                let mut fresh = tiny_skia::Pixmap::new(width, height).unwrap();
+                renderer.draw(
+                    &mut fresh.as_mut(),
+                    &mut mask,
+                    &graphics_viewport,
+                    &[viewport],
+                    iced::Color::WHITE,
+                );
+                assert_eq!(
+                    pixels.data(),
+                    fresh.data(),
+                    "partial redraw differs at scale {scale}, frame {frame}"
+                );
+                for y in (0..(20. * scale) as usize)
+                    .chain((171. * scale).ceil() as usize..height as usize)
+                {
+                    let width = width as usize;
+                    assert!(
+                        pixels.pixels()[y * width..(y + 1) * width]
+                            .iter()
+                            .all(|p| p.red() == 255 && p.green() == 255 && p.blue() == 255),
+                        "log glyphs escaped at row {y}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
     fn software_renderer_draws_visible_highlighted_log_glyphs() {
         use iced::advanced::{Layout, layout, mouse, renderer, widget::Tree};
         let mut view = LogView::default();

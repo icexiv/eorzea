@@ -8,7 +8,7 @@ eorzea 的全部配置落在 `~/.eorzea/`（Windows 上即 `C:\Users\<用户>\.e
 
 | 路径 | 内容 |
 |------|------|
-| `~/.eorzea/config.toml` | 主配置：游戏目录、大区、补丁下载、Dalamud；Linux/macOS 另有 Wine、DXVK 与自定义环境变量 |
+| `~/.eorzea/config.toml` | 主配置：游戏目录、大区、补丁下载、国服启动途径、Dalamud；Linux/macOS 另有 Wine、DXVK 与自定义环境变量 |
 | `~/.eorzea/auth.toml` | 已保存账号与自动登录 session key（由 `eoz auth` / GUI 登录页管理） |
 
 ### 首次运行
@@ -21,8 +21,8 @@ eorzea 的全部配置落在 `~/.eorzea/`（Windows 上即 `C:\Users\<用户>\.e
 
 | 平台 | `config.toml` 内容 |
 |------|--------------------|
-| Linux / macOS | `game_path`、可选的 `area`、`[download]`、平铺的 Wine 设置（`startup_type`/`custom_path`/`prefix`/`esync`/`fsync`/`msync`/`gamemode`、`[dxvk]`、`[env]`）、`[dalamud]` |
-| Windows | `game_path`、可选的 `area`、`[download]`、`[dalamud]`；不写 Wine/DXVK/环境变量，`eoz config set startup_type` 等会报「未知配置键」 |
+| Linux / macOS | `game_path`、可选的 `area`、`[download]`、`[launch]`、`[launcher_update]`、平铺的 Wine 设置（`startup_type`/`custom_path`/`prefix`/`esync`/`fsync`/`msync`/`gamemode`、`[dxvk]`、`[env]`）、`[dalamud]` |
+| Windows | `game_path`、可选的 `area`、`[download]`、`[launch]`、`[launcher_update]`、`[dalamud]`；不写 Wine/DXVK/环境变量，`eoz config set startup_type` 等会报「未知配置键」 |
 
 在 Windows 上读取 Linux/macOS 写出的配置时，Wine 相关键会被忽略；再保存会把它们移除。`eoz config list` 只输出当前平台的字段。
 
@@ -60,6 +60,35 @@ concurrency = 8
 min_concurrency = 4
 ```
 
+### `[launch]`
+
+`launch.method` 默认 `"injector"`，也可设为 `"sdo_dll"`。GUI 设置页「启动」区、主页启动区与 CLI `--launch-method injector|sdo_dll` 共用该配置；主页切换会立即写入配置。未包含此字段的配置也使用 Injector。
+
+- **`injector`**：使用国服 Injector 内的 ArgFixer 提供游戏登录参数，不部署或要求 SDO 登录 DLL。启动前校验分发包与游戏版本，按需下载组件及 Windows .NET；关闭 Dalamud 时仍使用 Injector，但传入 `--without-dalamud`，不准备 Dalamud assets、不加载游戏内框架或插件。
+- **`sdo_dll`**：直接运行游戏，独立准备官方原版入口与固定摘要的 ottercorp shim，不要求 Injector/.NET。该途径不加载 Dalamud，但不会改动 `[dalamud].enabled`；该设置保留给 Injector 途径。只有显式要求“这条途径加载 Dalamud”（例如 CLI 同时传 `--launch-method sdo_dll --dalamud`）才在登录前报错。原版缺失时从官方启动器更新 ZIP 获取，验证清单、整包与 DLL 摘要和 x64 导出，只部署两个入口文件。已有有效原版备份不覆盖；损坏或误存为 shim 的备份会报错要求检查，不静默丢弃。详见 [SDO 获取与验证边界](notes/sdo-installation.md)。
+
+两种途径都在账号重新认证前完成自身准备，准备失败不换取 ticket，也不自动回退到另一种途径。Injector 关闭 Dalamud 仍需要版本兼容的组件；`--no-dalamud` 不能绕过登录修补所需的版本门控。
+
+```toml
+[launch]
+method = "injector"
+
+[dalamud]
+enabled = false
+```
+
+### `[launcher_update]`
+
+仅 GUI 使用，不影响游戏补丁或 Dalamud，也不会让 CLI 在启动时联网检查。设置保存后生效；手动检查绕过缓存。
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `launcher_update.check_on_startup` | bool | `true` | GUI 启动后后台检查一次；失败不阻断其他功能 |
+| `launcher_update.channel` | enum | `"auto"` | `auto` 跟随发行构建通道，源码/Nix 默认查询 Dev；也可选 `stable` / `dev`。未发布的通道明确显示未发布，不自动切通道 |
+| `launcher_update.source` | enum | `"auto"` | `auto` 国内镜像优先、失败回退 GitHub；`mirror` / `github` 只使用所选来源 |
+
+成功清单按来源缓存 6 小时，位置为系统缓存目录下的 `eorzea/launcher-updates/`。检查只有版本清单请求，不下载或替换程序；Nix 用户通过包源升级，详见 [Nix 更新策略](nix.md)。
+
 ### Wine（顶层平铺）
 
 Wine 字段通过 `#[serde(flatten)]` 直接写在 TOML 顶层（兼容旧格式），没有 `[wine]` 表。
@@ -88,7 +117,7 @@ Wine 字段通过 `#[serde(flatten)]` 直接写在 TOML 顶层（兼容旧格式
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `dalamud.enabled` | bool | `false` | 启用 Dalamud（opt-in）。CLI 可用 `--dalamud` / `--no-dalamud` 单次覆盖。**启用即强制**：准备失败（元数据不可达、与游戏版本不匹配、下载/校验失败、runtime 或 assets 缺失）会直接报错且不启动游戏，需要显式 `--no-dalamud`（GUI 用主页「本次启动加载 Dalamud」开关）才能不带插件进游戏 |
+| `dalamud.enabled` | bool | `false` | 是否在 Injector 途径加载游戏内 Dalamud（opt-in）。CLI 用 `--dalamud` / `--no-dalamud` 单次覆盖；GUI 设置页「启动」区与主页的开关写同一字段。原版 DLL 途径不加载 Dalamud，但保留这里的值，切回 Injector 后继续生效。准备失败不静默降级 |
 | `dalamud.load_method` | string | `"entrypoint"` | 加载方式：`entrypoint`（入口点改写，推荐）、`dllinject`（远程注入）、`aclonly`（只做兼容修复、不加载 Dalamud，排障用） |
 | `dalamud.delay_initialize_ms` | uint | `0` | 注入后延迟初始化毫秒数 |
 | `dalamud.no_plugins` | bool | `false` | safe mode：禁用全部插件 |

@@ -562,9 +562,8 @@ impl Launcher {
 
     /// 启动游戏，可覆盖 Dalamud 启用状态（`Some(true/false)` 覆盖 `[dalamud].enabled`）。
     ///
-    /// 会**先**准备 Dalamud（[`Self::prepare_dalamud`]）再交给 [`Self::launch_prepared`]。
-    /// 调用方若想避免一次性 SSO ticket 被 Dalamud 失败消耗，应在登录前自己调
-    /// `prepare_dalamud`，再调用 `launch_prepared`。
+    /// 先按配置准备启动途径（[`Self::prepare_launch`]），再交给 [`Self::launch_prepared`]。
+    /// 日常启动应使用 [`Self::launch_account`]，在换取 ticket 前完成准备。
     pub async fn launch_with_options(
         &self,
         wine: &WineSettings,
@@ -576,8 +575,9 @@ impl Launcher {
     ) -> Result<GameLaunchResult, LauncherError> {
         let game_path = game_path.as_ref().to_path_buf();
         let dalamud = self
-            .prepare_dalamud(
+            .prepare_launch(
                 Self::game_root_of(&game_path),
+                None,
                 dalamud_override,
                 |_, _, _| {},
             )
@@ -586,10 +586,9 @@ impl Launcher {
             .await
     }
 
-    /// 用已经准备好的 Dalamud 配置启动游戏（不再做网络/磁盘检查）。
+    /// 用已经准备好的启动途径创建游戏进程（不再下载组件，仍执行本地预检）。
     ///
-    /// 与 [`Self::launch_with_options`] 配合：`prepare_dalamud` → 登录 → 本函数，
-    /// 这样 Dalamud 准备失败发生在换取 ticket 之前。
+    /// `prepare_launch` → 登录 → 本函数；Some 为 Injector，None 为原版 + shim。
     pub async fn launch_prepared(
         &self,
         wine: &WineSettings,
@@ -677,7 +676,8 @@ impl Launcher {
             .unwrap_or(game_path)
     }
 
-    /// 准备 Dalamud：版本门控 + 惰性补齐 release / runtime / assets。
+    /// 兼容 API：只准备启用的 Dalamud，不选择国服启动途径。
+    /// 完整启动必须使用 [`Self::prepare_launch`]，不可把此处的 None 当作已准备的 DLL 途径。
     ///
     /// `game_root` 是**游戏根目录**（含 `game/`、`boot/`）。
     ///
@@ -695,7 +695,7 @@ impl Launcher {
         &self,
         game_root: &Path,
         enabled_override: Option<bool>,
-        mut on_progress: impl FnMut(DalamudPhase, u64, u64),
+        on_progress: impl FnMut(DalamudPhase, u64, u64),
     ) -> Result<Option<GameLaunchConfigDalamud>, LauncherError> {
         let settings = crate::config::load_dalamud_settings();
         let enabled = enabled_override.unwrap_or(settings.enabled);
@@ -703,6 +703,64 @@ impl Launcher {
             debug!("Dalamud disabled for this launch");
             return Ok(None);
         }
+
+        self.prepare_injector(game_root, settings, true, on_progress)
+            .await
+            .map(Some)
+    }
+
+    /// 准备选定的国服启动途径；必须在换取短期 ticket 前调用。
+    /// 不自动回退到另一条途径，也不因关闭 Dalamud 跳过 ArgFixer。
+    pub async fn prepare_launch(
+        &self,
+        game_root: &Path,
+        method_override: Option<crate::config::SdoLaunchMethod>,
+        dalamud_override: Option<bool>,
+        mut on_progress: impl FnMut(DalamudPhase, u64, u64),
+    ) -> Result<Option<GameLaunchConfigDalamud>, LauncherError> {
+        let config = crate::config::load_app_default();
+        let method = method_override.unwrap_or(config.launch.method);
+        let enabled = dalamud_override.unwrap_or(config.dalamud.enabled);
+        // 配置里的 Dalamud 开关在 DLL 途径下只是保留、不生效；
+        // 但显式要求该途径加载 Dalamud 无法满足，必须报错而不是装作加载了。
+        if !method.loads_dalamud() && dalamud_override == Some(true) {
+            return Err(LauncherError::LaunchNotReady(
+                "原版 DLL 启动途径无法加载 Dalamud；请改用 Injector 途径".into(),
+            ));
+        }
+        match method {
+            crate::config::SdoLaunchMethod::Injector => self
+                .prepare_injector(game_root, config.dalamud, enabled, on_progress)
+                .await
+                .map(Some),
+            crate::config::SdoLaunchMethod::SdoDll => {
+                on_progress(DalamudPhase::LoginDll, 0, 0);
+                crate::sdo_entry::prepare(game_root, |done, total| {
+                    on_progress(DalamudPhase::LoginDll, done, total);
+                })
+                .await
+                .map_err(|e| LauncherError::LaunchNotReady(e.to_string()))?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn prepare_injector(
+        &self,
+        game_root: &Path,
+        settings: crate::dalamud::model::DalamudSettings,
+        enabled: bool,
+        mut on_progress: impl FnMut(DalamudPhase, u64, u64),
+    ) -> Result<GameLaunchConfigDalamud, LauncherError> {
+        let load_framework = enabled && !settings.load_method.without_dalamud();
+        // 即使不加载 Dalamud，ArgFixer 也依赖游戏版本；不做无版本门控的修补。
+        let not_ready = |reason: String| {
+            if load_framework {
+                LauncherError::DalamudNotReady(reason)
+            } else {
+                LauncherError::LaunchNotReady(format!("Injector / ArgFixer 未就绪：{reason}"))
+            }
+        };
 
         let install_root = settings
             .install_root
@@ -715,13 +773,13 @@ impl Launcher {
                 .await;
 
         let Some(remote) = st.remote.as_ref() else {
-            return Err(LauncherError::DalamudNotReady(format!(
+            return Err(not_ready(format!(
                 "无法获取 release 元数据（track={}），且本机没有可用的 version.json 记录",
                 settings.track
             )));
         };
         if remote.supported_game_ver != st.local_game_ver {
-            return Err(LauncherError::DalamudNotReady(format!(
+            return Err(not_ready(format!(
                 "release {} 尚不支持当前游戏版本（支持 {}，本地 {}）{}",
                 remote.assembly_version,
                 remote.supported_game_ver,
@@ -743,11 +801,17 @@ impl Launcher {
             |done, total| on_progress(DalamudPhase::Release, done, total),
         )
         .await
-        .map_err(|e| LauncherError::DalamudNotReady(format!("release 本体不可用：{e}")))?;
+        .map_err(|e| not_ready(format!("release 本体不可用：{e}")))?;
+        for file in ["Dalamud.Injector.dll", "FfxivArgLauncher.dll"] {
+            if !install_path.join(file).is_file() {
+                return Err(not_ready(format!("国服 Injector 缺少 {file}")));
+            }
+        }
 
         // 路径对齐上游目录布局：install_root 本身相当于 storage root，
         // 不要再额外套一层 `install_root/dalamud/...`。
-        let runtime_required = remote.runtime_required || settings.manage_runtime;
+        let runtime_required =
+            !load_framework || remote.runtime_required || settings.manage_runtime;
         let runtime_dir = if runtime_required {
             // 2. Windows x64 .NET runtime
             on_progress(DalamudPhase::Runtime, 0, 0);
@@ -760,7 +824,7 @@ impl Launcher {
                 )
                 .await
                 .map_err(|e| {
-                    LauncherError::DalamudNotReady(format!(
+                    not_ready(format!(
                         "Windows .NET runtime {} 不可用：{e}",
                         remote.runtime_version
                     ))
@@ -774,20 +838,26 @@ impl Launcher {
         };
 
         // 3. assets（字体/DATA 级别资源）
-        on_progress(DalamudPhase::Assets, 0, 0);
-        let asset_dir = crate::dalamud::ensure_assets(&client, &install_root, |done, total| {
-            on_progress(DalamudPhase::Assets, done, total)
-        })
-        .await
-        .map_err(|e| LauncherError::DalamudNotReady(format!("assets 不可用：{e}")))?;
+        let asset_dir = if load_framework {
+            on_progress(DalamudPhase::Assets, 0, 0);
+            crate::dalamud::ensure_assets(&client, &install_root, |done, total| {
+                on_progress(DalamudPhase::Assets, done, total)
+            })
+            .await
+            .map_err(|e| not_ready(format!("assets 不可用：{e}")))?
+        } else {
+            install_root.join("dalamudAssets")
+        };
 
         info!(
             version = %remote.assembly_version,
             install = %install_path.display(),
-            "Dalamud ready"
+            load_framework,
+            "Injector ready"
         );
 
-        Ok(Some(GameLaunchConfigDalamud {
+        Ok(GameLaunchConfigDalamud {
+            without_dalamud: !load_framework,
             injector_exe: install_path.join("Dalamud.Injector.exe"),
             install_dir: install_path,
             config_path: install_root.join("dalamudConfig.json"),
@@ -799,7 +869,7 @@ impl Launcher {
             delay_initialize_ms: settings.delay_initialize_ms,
             no_plugins: settings.no_plugins,
             no_third_party_plugins: settings.no_third_party_plugins,
-        }))
+        })
     }
 }
 
@@ -812,6 +882,8 @@ impl Default for Launcher {
 /// Dalamud 准备的阶段（[`Launcher::prepare_dalamud`] 的进度回调）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DalamudPhase {
+    /// 原版登录入口及 shim。
+    LoginDll,
     /// release 本体：下载归档 → 解压 → 逐文件校验 → 原子安装
     Release,
     /// 托管的 Windows x64 .NET runtime
@@ -824,7 +896,8 @@ impl DalamudPhase {
     /// 面向用户的阶段名。
     pub fn label(self) -> &'static str {
         match self {
-            Self::Release => "release 本体",
+            Self::LoginDll => "SDO 登录 DLL",
+            Self::Release => "国服 Injector 组件",
             Self::Runtime => "Windows .NET runtime",
             Self::Assets => "Dalamud assets",
         }
@@ -834,6 +907,8 @@ impl DalamudPhase {
 /// Launcher 层错误。
 #[derive(Debug, thiserror::Error)]
 pub enum LauncherError {
+    #[error("启动途径未就绪：{0}")]
+    LaunchNotReady(String),
     #[error("Auth error: {0}")]
     Auth(String),
     /// Dalamud 已启用但未能就绪。**不会静默降级**：调用方应报错并让用户

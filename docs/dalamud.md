@@ -2,11 +2,13 @@
 
 eorzea 支持通过 Dalamud.Injector 加载 Dalamud 插件框架：Linux/macOS 在与游戏相同的 Wine prefix 内运行 Injector，Windows 原生运行。
 
-设计原则是**版本门控 + 启用即强制**：`SupportedGameVer == 本地游戏版本` 才允许加载；启用 Dalamud（配置 `[dalamud].enabled = true` 或 `--dalamud` / GUI「本次启动加载」开关）后，任何环节没准备好都**直接报错、不启动游戏**，不会静默启动一个没有插件的游戏。想在没有 Dalamud 的情况下进游戏必须显式选择：`--no-dalamud`、GUI 关闭本次开关，或改配置。
+国服登录途径由 `[launch].method` 独立选择，默认 `injector`。关闭 Dalamud 时仍使用 Injector / ArgFixer，保留版本门控和所需 .NET 准备，但跳过 assets 和游戏内框架。`sdo_dll` 途径独立准备官方原版 + shim，不使用 Injector，也不加载 Dalamud；它不改写 `[dalamud].enabled`，切回 Injector 后按原设置生效。详见 [`config.md`](config.md) 的 `[launch]` 一节。
+
+设计原则是**版本门控 + 启用即强制**：`SupportedGameVer == 本地游戏版本` 才允许加载；启用 Dalamud（配置 `[dalamud].enabled = true`、设置页「启动」区，或 `--dalamud` / 设置页与主页的「启用 Dalamud」开关）后，任何环节没准备好都**直接报错、不启动游戏**，不会静默启动一个没有插件的游戏。想在没有 Dalamud 的情况下进游戏必须显式选择：`--no-dalamud` 或关闭该开关。（原版 DLL 途径不加载 Dalamud，但保留该设置。）
 
 ```bash
 eoz launch --dalamud        # 强制本次加载；未就绪 → 报错退出（不启动游戏）
-eoz launch --no-dalamud     # 强制本次不加载（游戏照常启动）
+eoz launch --no-dalamud     # 本次不加载插件框架，仍准备所选启动途径
 ```
 
 配置字段见 [`config.md`](config.md) 的 `[dalamud]` 一节；加载机制的深度调研见 [`notes/dalamud_integration.md`](notes/dalamud_integration.md)。
@@ -41,21 +43,21 @@ eoz launch --no-dalamud     # 强制本次不加载（游戏照常启动）
 | `Ready` | 已安装且版本匹配 | 走 Injector |
 | `Missing` | 未安装，但 release 匹配游戏版本 | 自动下载安装后走 Injector |
 | `OutOfDate` | 已安装但版本不匹配 | **报错，不启动游戏** |
-| `Unsupported` | release 尚未支持当前游戏版本 | **报错，不启动游戏**（等待 Dalamud 发版，或显式 `--no-dalamud` 进游戏） |
+| `Unsupported` | release 尚未支持当前游戏版本 | **报错，不启动游戏**（Injector 即使不加载 Dalamud 也需匹配版本） |
 | `RuntimeMissing` | release 要求 .NET runtime 但未安装 | 自动下载后走 Injector |
 | `AssetsMissing` | assets 缺失 | 自动下载后走 Injector |
 
-游戏更新后 Dalamud release 通常要一两天才跟进，这期间要么用 `--no-dalamud` 进游戏，要么在设置里关掉 Dalamud。
+游戏更新而 release 未跟进时，`--no-dalamud` 不能绕过 Injector / ArgFixer 版本门控。可等待匹配版本，或显式选择 `--launch-method sdo_dll --no-dalamud`，其原版准备与运行时兼容性要求仍需满足。
 
 ## 启动时的自动准备流程
 
 启用 Dalamud 的启动会**先**准备 Dalamud、再登录（避免失败白白消耗一次性 SSO ticket）；任一步失败都报错并终止启动（`LauncherError::DalamudNotReady`），不会静默降级：
 
 1. 获取远端元数据：请求失败按重试（8s/次超时、4xx 不重试；本机已有安装时只试 1 次，避免离线启动白等），仍失败则退回本机 `Hooks/<版本>/version.json`（安装时原样保存的服务端元数据）；连本地记录都没有 → **报错**。这样一次网络抖动不会把已装好且匹配的 Dalamud 拦下来，`DalamudStatus.remote_from_cache` 会标出「元数据来自本地记录」。
-2. 版本门控：`SupportedGameVer != 本地游戏版本` → **报错**（提示等待发版，并说明可用 `--no-dalamud` 进游戏）。
+2. 版本门控：`SupportedGameVer != 本地游戏版本` → **报错**，关闭 Dalamud 不跳过此检查。
 3. **Hooks（release 本体）**：本地 `Hooks/<AssemblyVersion>` 无有效安装（缺关键文件或 MD5 校验失败）→ 从元数据 `downloadUrl` 下载归档，用内置的**纯 Rust 解压**（按文件头识别 7z/zip，不依赖外部 `7z` 命令）展开，校验关键文件与逐文件 MD5，原子 rename 到 `Hooks/<AssemblyVersion>/`、写 `version.json` 并清理旧版本目录（保留 `dev`）。已安装且校验通过时跳过下载；失败 → **报错**。
 4. **runtime**：`RuntimeRequired` 或 `dalamud.manage_runtime = true` 时，从华为 NuGet 镜像（失败回退官方 NuGet）下载 `Microsoft.{NETCore,WindowsDesktop}.App` 的 win-x64 runtime nupkg，只提取需要的目录，组装后原子替换到 `runtime/`；本机已是目标版本时直接复用（不联网）；失败 → **报错**。注入前会把 `DALAMUD_RUNTIME` / `DOTNET_ROOT` 指向它（非 Windows 经 `winepath` 转 Windows 路径，Windows 直接传原生路径），不依赖 wine-mono。
-5. **assets**：从 `https://aonyx.ffxiv.wang/Dalamud/Asset/Meta` 取元数据，逐文件 SHA1 校验、缺失才下载；Noto 字体有多个 CTAN 镜像 fallback。完成后写 `asset.ver` 并清理旧版本目录（保留 `dev`）。元数据拉取失败时退回本地 `dalamudAssets/<asset.ver>`；连本地都没有 → **报错**。
+5. **assets**：仅加载游戏内 Dalamud 时，从 `https://aonyx.ffxiv.wang/Dalamud/Asset/Meta` 取元数据，逐文件 SHA1 校验、缺失才下载；Noto 字体有多个 CTAN 镜像 fallback。完成后写 `asset.ver` 并清理旧版本目录（保留 `dev`）。元数据拉取失败时退回本地 `dalamudAssets/<asset.ver>`；连本地都没有 → **报错**。关闭 Dalamud 或选择 `aclonly` 时不准备 assets，并确保 ArgFixer 所需的 .NET runtime。
 
 因此**本地三件套齐全时，完全离线也能照常加载 Dalamud**（`eoz dalamud install` 同样如此，见下）；而真正缺东西时会明确报错告诉你缺什么，而不是悄悄不带插件启动。
 
@@ -83,12 +85,9 @@ eoz dalamud status                    # 查看版本兼容性/缺失组件
 eoz dalamud install                   # 预下载安装 release + runtime + assets（失败即报错退出）
 eoz config set dalamud.enabled true   # 启用（启用后 launch 未就绪会报错，不再静默降级）
 eoz launch                            # 版本匹配时自动安装并加载
-eoz launch --no-dalamud               # 本次不加载（游戏照常启动；游戏刚更新、release 未跟进时用）
+eoz launch --no-dalamud               # 不加载插件，仍保留 Injector 登录修补与版本门控
 eoz config set dalamud.no_plugins true  # 崩溃排查：safe mode
 ```
 
-`dalamud install` 与 `launch` 的惰性准备走同一套函数与版本门控（`Launcher::prepare_dalamud`
-→ `updater::ensure_release` → `ensure_runtime` → `ensure_assets`），区别只在时机：`install`
-适合提前把组件备齐（离线/弱网时不必赌启动那一刻的下载），`launch` 则在启动前顺带补齐。
-两者的失败都会显式报错：`install` 直接退出；`launch` 终止启动并提示用 `--no-dalamud` 跳过。
+`dalamud install` 适合提前准备框架组件。`launch` 经 `Launcher::prepare_launch` 按所选途径准备；Injector 途径复用 release/runtime/assets 安装函数，DLL 途径不准备这些组件。失败均显式报错，不自动换途径；`--no-dalamud` 只跳过插件框架及 assets，不能跳过 Injector 必需的组件或版本检查。
 已安装且 `hashes.json` 校验通过时两者都跳过下载。

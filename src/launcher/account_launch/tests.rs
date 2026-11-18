@@ -71,6 +71,7 @@ impl Fixture {
             area,
             wine: &self.wine,
             dalamud: Some(false),
+            launch_method: Some(crate::config::SdoLaunchMethod::Injector),
         }
     }
 }
@@ -143,10 +144,10 @@ impl MockAuth {
         }
     }
 
-    fn launcher(&self) -> Launcher {
+    fn launcher(&self) -> MockLauncher {
         let mut launcher = Launcher::new().unwrap();
         launcher.auth = launcher.auth.with_fallback_url(&self.url);
-        launcher
+        MockLauncher(launcher)
     }
 
     fn auto_login_requests(&self) -> Vec<String> {
@@ -157,6 +158,27 @@ impl MockAuth {
             .filter(|p| p.starts_with("/autoLogin.json?"))
             .cloned()
             .collect()
+    }
+}
+
+struct MockLauncher(Launcher);
+impl std::ops::Deref for MockLauncher {
+    type Target = Launcher;
+    fn deref(&self) -> &Launcher {
+        &self.0
+    }
+}
+impl MockLauncher {
+    async fn launch_account(
+        &self,
+        request: LaunchRequest<'_>,
+        event: impl FnMut(LaunchEvent),
+    ) -> Result<GameLaunchResult, LauncherError> {
+        self.0.validate_launch_request(&request)?;
+        let config = crate::game::mock_injector_config(request.game_root);
+        self.0
+            .launch_account_prepared(request, Some(config), event)
+            .await
     }
 }
 
@@ -221,6 +243,40 @@ async fn every_launch_attempt_authenticates_again_and_saves_before_starting() {
             .count(),
         3
     );
+}
+
+#[tokio::test]
+async fn selected_route_preparation_errors_do_not_authenticate_or_rotate_keys() {
+    let fixture = Fixture::new();
+    let server = MockAuth::new(|_| None).await;
+    let launcher = server.launcher();
+    let before = std::fs::read(&fixture.auth_path).unwrap();
+    // 冲突组合必须在登录前失败，不静默换途径/关闭 Dalamud。
+    let mut request = fixture.request(None);
+    request.launch_method = Some(crate::config::SdoLaunchMethod::SdoDll);
+    request.dalamud = Some(true);
+    let error = launcher
+        .0
+        .launch_account(request, |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LauncherError::LaunchNotReady(_)));
+    // 无效原版备份也必须在联网认证前失败，且不得覆盖。
+    std::fs::write(
+        fixture.root.join(crate::sdo_entry::ORIGINAL),
+        b"keep invalid backup",
+    )
+    .unwrap();
+    let mut request = fixture.request(None);
+    request.launch_method = Some(crate::config::SdoLaunchMethod::SdoDll);
+    let error = launcher
+        .0
+        .launch_account(request, |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LauncherError::LaunchNotReady(_)));
+    assert!(server.requests.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read(&fixture.auth_path).unwrap(), before);
 }
 
 #[tokio::test]

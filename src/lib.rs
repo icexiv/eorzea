@@ -5,6 +5,7 @@ pub mod dalamud;
 pub mod game;
 pub mod game_files;
 pub mod launcher;
+pub mod sdo_entry;
 pub mod term_img;
 /// Wine 兼容层：仅 Linux/macOS。Windows 原生启动不使用 Wine。
 #[cfg(not(target_os = "windows"))]

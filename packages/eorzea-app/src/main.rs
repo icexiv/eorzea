@@ -1,11 +1,21 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod build_info;
 mod clipboard;
 mod logging;
 mod ui;
+mod updates;
 
 fn main() -> iced::Result {
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        let info = build_info::BuildInfo::current();
+        println!("{}\n{}", info.display(), info.distribution.label());
+        if let Some(commit) = info.commit {
+            println!("commit: {commit}");
+        }
+        return Ok(());
+    }
     logging::init();
     tracing::info!("GUI renderer: Iced / tiny-skia (CPU software rendering)");
     let fonts = ui::theme::system_fonts();

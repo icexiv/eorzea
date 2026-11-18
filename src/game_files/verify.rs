@@ -229,10 +229,7 @@ pub fn verify_game(game_root: &Path, max_expansion: i32) -> Vec<GameFileIssue> {
     }
 
     // 2. 关键文件
-    let key_files = [
-        ("game/ffxiv_dx11.exe", "游戏主程序"),
-        ("sdo/sdologin/sdologinentry64.dll", "登录认证 DLL"),
-    ];
+    let key_files = [("game/ffxiv_dx11.exe", "游戏主程序")];
     for (rel, desc) in key_files {
         if !game_root.join(rel).exists() {
             issues.push(GameFileIssue {
@@ -263,6 +260,38 @@ pub fn verify_game(game_root: &Path, max_expansion: i32) -> Vec<GameFileIssue> {
         });
     }
 
+    issues
+}
+
+/// 游戏数据校验 + 所选启动途径的本地入口检查；不下载组件，也不执行 DLL。
+pub fn verify_game_for_launch(
+    game_root: &Path,
+    max_expansion: i32,
+    method: crate::config::SdoLaunchMethod,
+) -> Vec<GameFileIssue> {
+    let mut issues = verify_game(game_root, max_expansion);
+    if method == crate::config::SdoLaunchMethod::SdoDll {
+        let mut missing = false;
+        for rel in [crate::sdo_entry::ENTRY, crate::sdo_entry::ORIGINAL] {
+            if !game_root.join(rel).is_file() {
+                missing = true;
+                issues.push(GameFileIssue {
+                    severity: IssueSeverity::Missing,
+                    path: rel.into(),
+                    message: "原版 DLL 启动途径的登录入口缺失；启动前会自动准备".into(),
+                });
+            }
+        }
+        if !missing {
+            if let Err(error) = crate::sdo_entry::validate_installation(game_root) {
+                issues.push(GameFileIssue {
+                    severity: IssueSeverity::Corrupt,
+                    path: "sdo/sdologin".into(),
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
     issues
 }
 
@@ -348,5 +377,21 @@ mod tests {
                     && i.severity == IssueSeverity::Corrupt)
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn login_dll_is_only_required_by_the_dll_launch_route() {
+        let root = std::env::temp_dir().join(format!("eorzea-verify-route-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let injector =
+            super::verify_game_for_launch(&root, 0, crate::config::SdoLaunchMethod::Injector);
+        assert!(injector.iter().all(|i| !i.path.starts_with("sdo/")));
+        let dll = super::verify_game_for_launch(&root, 0, crate::config::SdoLaunchMethod::SdoDll);
+        for expected in [crate::sdo_entry::ENTRY, crate::sdo_entry::ORIGINAL] {
+            assert!(
+                dll.iter()
+                    .any(|i| i.path == expected && i.severity == super::IssueSeverity::Missing)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

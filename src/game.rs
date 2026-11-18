@@ -34,13 +34,15 @@ pub struct GameLaunchConfig {
     pub reset_config: i32,
     /// 额外启动参数。
     pub additional_args: String,
-    /// 启用 Dalamud 时的启动配置（`Some` 时通过 Injector 启动）。
+    /// Injector 启动配置（兼容字段名）；None 表示原版 DLL + shim 途径。
     pub dalamud: Option<DalamudLaunchConfig>,
 }
 
 /// Dalamud 启动配置（启用时由 Injector 创建游戏进程）。
 #[derive(Debug, Clone)]
 pub struct DalamudLaunchConfig {
+    /// 只执行 ArgFixer，不加载游戏内 Dalamud。
+    pub without_dalamud: bool,
     /// Injector 可执行文件路径（`Hooks/<AssemblyVersion>/Dalamud.Injector.exe`，Unix 路径）。
     pub injector_exe: PathBuf,
     /// 发行目录（Injector 工作目录）。
@@ -196,124 +198,15 @@ fn build_lobby_hosts(areas: &[SdoArea]) -> String {
         .join("|")
 }
 
-/// 确保登录入口 DLL 是 ottercorp 修改版。
-///
-/// 对应 C# `SdoLauncher.EnsureLoginEntry()`。原版 `sdologinentry64.dll` 有认证保护，
-/// 必须使用修改版才能通过第三方启动器登录。
+/// 准备原版 + shim 登录途径（兼容入口）；Injector 途径不应调用此函数。
 #[instrument]
 pub async fn ensure_login_entry(game_path: &std::path::Path) -> Result<(), GameLaunchError> {
     let game_root = game_path
         .parent()
         .and_then(|p| p.parent())
         .unwrap_or_else(|| std::path::Path::new("."));
-    let boot_path = game_root.join("sdo/sdologin");
-    let entry_dll = boot_path.join("sdologinentry64.dll");
-
-    info!(game_root = %game_root.display(), "ensuring login entry DLL");
-
-    let check_dll = entry_dll.clone();
-    let replace = crate::blocking::run(move || -> Result<bool, GameLaunchError> {
-        std::fs::create_dir_all(&boot_path)?;
-        if !check_dll.exists() {
-            info!(path = %check_dll.display(), "DLL not found, downloading ottercorp version");
-            return Ok(true);
-        }
-        if !is_ottercorp_dll(&check_dll) {
-            info!(path = %check_dll.display(), "existing DLL is not ottercorp version, replacing");
-            let backup = boot_path.join("sdologinentry64.sdo.dll");
-            // 备份是 shim 转发的目标，已有备份时不得覆盖。
-            if !backup.exists() {
-                std::fs::copy(&check_dll, &backup)?;
-                info!(backup = %backup.display(), "backed up original DLL");
-            }
-            Ok(true)
-        } else {
-            debug!(path = %check_dll.display(), "existing DLL is already ottercorp version");
-            Ok(false)
-        }
-    })
-    .await??;
-    if replace {
-        let src = download_ottercorp_dll().await?;
-        crate::blocking::run(move || {
-            std::fs::copy(&src, &entry_dll)?;
-            info!(src = %src.display(), dst = %entry_dll.display(), "copied ottercorp sdologinentry64.dll");
-            Ok::<_, std::io::Error>(())
-        })
-        .await??;
-    }
-
+    crate::sdo_entry::prepare(game_root, |_, _| {}).await?;
     Ok(())
-}
-
-#[instrument]
-async fn download_ottercorp_dll() -> Result<std::path::PathBuf, GameLaunchError> {
-    const DLL_URL: &str = "https://raw.githubusercontent.com/ottercorp/XIVLauncher.Core/cn/src/XIVLauncher.Core/Resources/binaries/sdologinentry64.dll";
-
-    let tools_dir = dirs::home_dir()
-        .map(|h| h.join(".eorzea/tools"))
-        .unwrap_or_else(|| std::path::PathBuf::from("./tools"));
-    std::fs::create_dir_all(&tools_dir).map_err(GameLaunchError::Io)?;
-
-    let dll_path = tools_dir.join("sdologinentry64.dll");
-
-    if dll_path.exists() {
-        debug!(path = %dll_path.display(), "DLL already cached locally");
-        return Ok(dll_path);
-    }
-
-    info!(
-        url = DLL_URL,
-        "downloading sdologinentry64.dll from ottercorp"
-    );
-    let client = reqwest::Client::new();
-    let response = client.get(DLL_URL).send().await.map_err(|e| {
-        error!(error = %e, "download request failed");
-        GameLaunchError::Wine(format!("Download failed: {e}"))
-    })?;
-
-    let status = response.status();
-    if !status.is_success() {
-        error!(status = %status, "download returned non-success status");
-        return Err(GameLaunchError::Wine(format!("HTTP {}", status)));
-    }
-    info!(status = %status, "download request successful");
-
-    let bytes = response.bytes().await.map_err(|e| {
-        error!(error = %e, "reading response bytes failed");
-        GameLaunchError::Wine(format!("Read failed: {e}"))
-    })?;
-
-    let len = bytes.len();
-    info!(bytes = len, "downloaded DLL");
-
-    crate::blocking::run(move || {
-        std::fs::write(&dll_path, &bytes)?;
-        info!(path = %dll_path.display(), bytes = len, "saved DLL to disk");
-        Ok::<_, std::io::Error>(dll_path)
-    })
-    .await?
-    .map_err(GameLaunchError::Io)
-}
-
-/// 检查 DLL 是否为 ottercorp 修改版（通过 PE 文件 version info 中的 CompanyName）。
-///
-/// 注意：PE version info 中的字符串以 UTF-16LE 存储（`o\0t\0t\0...`），
-/// 直接按字节/UTF-8 搜索 "ottercorp" 永远匹配不到，必须同时检查两种编码。
-#[instrument]
-fn is_ottercorp_dll(path: &std::path::Path) -> bool {
-    debug!(path = %path.display(), "checking if DLL is ottercorp version");
-    if let Ok(data) = std::fs::read(path) {
-        const ASCII: &[u8] = b"ottercorp";
-        // UTF-16LE 编码的 "ottercorp"
-        const UTF16LE: &[u8] = b"o\0t\0t\0e\0r\0c\0o\0r\0p\0";
-        let found = |needle: &[u8]| data.windows(needle.len()).any(|w| w == needle);
-        let result = found(ASCII) || found(UTF16LE);
-        debug!(is_ottercorp = result, "DLL check complete");
-        return result;
-    }
-    warn!(path = %path.display(), "failed to read DLL for ottercorp check");
-    false
 }
 
 /// 启动游戏进程。
@@ -339,8 +232,16 @@ pub async fn launch_game(
         return Err(GameLaunchError::UpdateInProgress);
     }
 
-    // 确保登录 DLL 是修改版
-    ensure_login_entry(&config.game_path).await?;
+    // Injector 的 ArgFixer 不加载 SDO DLL，不应部署或要求另一条途径的文件。
+    if config.dalamud.is_none() {
+        let root = config
+            .game_path
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        crate::blocking::run(move || crate::sdo_entry::validate_installation(&root)).await??;
+    }
 
     #[cfg(not(target_os = "windows"))]
     let tool = {
@@ -447,7 +348,7 @@ fn spawn_game(
                 &start,
                 d.load_method,
                 &arg_list,
-                false,
+                d.without_dalamud,
                 &env,
             )
             .map_err(|e| {
@@ -543,7 +444,7 @@ fn spawn_game(
                 &start,
                 d.load_method,
                 &arg_list,
-                false,
+                d.without_dalamud,
                 &env,
             )
             .map_err(|e| {
@@ -593,6 +494,8 @@ pub(crate) fn validate_wine_game_path(path: &std::path::Path) -> Result<(), Game
 
 #[derive(Debug, thiserror::Error)]
 pub enum GameLaunchError {
+    #[error("SDO 登录入口未就绪：{0}")]
+    LoginEntry(#[from] crate::sdo_entry::EntryError),
     #[error("游戏有未完成的更新，请先恢复并完成补丁应用")]
     UpdateInProgress,
     #[error("IO error: {0}")]
@@ -605,6 +508,24 @@ pub enum GameLaunchError {
         "Wine game path contains non-ASCII characters: {0}. Move the game to an ASCII-only path"
     )]
     UnsupportedWinePath(PathBuf),
+}
+
+#[cfg(test)]
+pub(crate) fn mock_injector_config(root: &std::path::Path) -> DalamudLaunchConfig {
+    DalamudLaunchConfig {
+        without_dalamud: true,
+        injector_exe: root.join("not-installed/injector.exe"),
+        install_dir: root.join("not-installed"),
+        config_path: root.join("dalamud.json"),
+        log_path: root.join("dalamud.log"),
+        plugin_dir: root.join("plugins"),
+        asset_dir: root.join("assets"),
+        runtime_dir: None,
+        load_method: crate::dalamud::model::DalamudLoadMethod::EntryPoint,
+        delay_initialize_ms: 0,
+        no_plugins: true,
+        no_third_party_plugins: true,
+    }
 }
 
 #[cfg(test)]
@@ -662,7 +583,7 @@ exit 2
             dc_travel_port: None,
             reset_config: 0,
             additional_args: String::new(),
-            dalamud: None,
+            dalamud: Some(mock_injector_config(&dir)),
         };
         let wine = WineSettings {
             startup_type: crate::config::WineStartupType::Custom,
@@ -740,40 +661,6 @@ exit 2
         ];
         let hosts = build_lobby_hosts(&areas);
         assert_eq!(hosts, "lobby1.sdo.com:54994|lobby5.sdo.com:54994");
-    }
-
-    #[test]
-    fn test_is_ottercorp_dll() {
-        let dir = std::env::temp_dir().join(format!("xlrs-dll-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // PE version info 以 UTF-16LE 存储 CompanyName
-        let utf16 = dir.join("utf16.dll");
-        std::fs::write(&utf16, b"\x00\x01o\0t\0t\0e\0r\0c\0o\0r\0p\0\x00\x01").unwrap();
-        assert!(is_ottercorp_dll(&utf16));
-
-        // 兼容纯 ASCII 出现的情况
-        let ascii = dir.join("ascii.dll");
-        std::fs::write(&ascii, b"prefix ottercorp suffix").unwrap();
-        assert!(is_ottercorp_dll(&ascii));
-
-        // 原版 DLL（不含 ottercorp）
-        let original = dir.join("original.dll");
-        std::fs::write(&original, b"Shanda Games sdologinentry64").unwrap();
-        assert!(!is_ottercorp_dll(&original));
-
-        // 真实缓存的修改版 DLL（如存在）必须被识别
-        if let Some(home) = dirs::home_dir() {
-            let cached = home.join(".eorzea/tools/sdologinentry64.dll");
-            if cached.exists() {
-                assert!(
-                    is_ottercorp_dll(&cached),
-                    "cached ottercorp DLL not detected"
-                );
-            }
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(not(target_os = "windows"))]

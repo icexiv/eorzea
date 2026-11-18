@@ -64,7 +64,7 @@ impl App {
                 false,
             ));
         }
-        let mut body = column![section("启动设置", launch)].spacing(12);
+        let mut body = column![section("账号与大区", launch)].spacing(12);
         let cards = self.cards();
         for pair in cards.chunks(2) {
             let mut stats = row![].spacing(12);
@@ -116,26 +116,44 @@ impl App {
             update = update.push(progress_panel(progress));
         }
         body.push(section("游戏更新", update))
-            .push(check(
-                "本次启动加载 Dalamud（插件）",
-                self.dalamud_this_launch,
+            .push(section("启动", self.home_launch_body(enabled)))
+            .into()
+    }
+    /// 主页的启动区：途径选择与本次插件开关放在启动按钮旁。
+    fn home_launch_body(&self, enabled: bool) -> Element<'_, Msg> {
+        let injector = self.config.launch.method == eorzea::config::SdoLaunchMethod::Injector;
+        let mut body = column![field(
+            "启动途径",
+            segments(
+                "home_method",
+                &["Dalamud Injector（推荐）", "原版 DLL + shim"],
+                usize::from(!injector),
+                enabled,
+            ),
+        )]
+        .spacing(10);
+        if injector {
+            body = body.push(check(
+                "启用 Dalamud（插件框架）",
+                self.config.dalamud.enabled,
                 "load",
                 enabled,
-            ))
-            .push(launch_button(
-                if self.operation == Operation::Launching {
-                    "启动中…"
-                } else {
-                    "启动游戏"
-                },
-                enabled && self.launcher.is_some(),
-            ))
-            .push(if self.operation == Operation::Launching {
-                text(&self.status).size(13).color(MUTED)
+            ));
+        }
+        body.push(launch_button(
+            if self.operation == Operation::Launching {
+                "启动中…"
             } else {
-                text("").size(1)
-            })
-            .into()
+                "启动游戏"
+            },
+            enabled && self.launcher.is_some(),
+        ))
+        .push(if self.operation == Operation::Launching {
+            text(&self.status).size(13).color(MUTED)
+        } else {
+            text("").size(1)
+        })
+        .into()
     }
     fn cards(&self) -> Vec<(&'static str, String, String, iced::Color)> {
         let mut cards = vec![
@@ -170,61 +188,64 @@ impl App {
                 INK,
             ),
         ];
-        let (main, detail, color) = if !self.dalamud_this_launch {
-            (
-                "本次不加载".into(),
-                "可用主页开关覆盖已保存配置。".into(),
-                MUTED,
-            )
-        } else if self.dalamud_loading {
-            ("检查中…".into(), "正在核对本地安装与游戏版本".into(), MUTED)
-        } else if let Some(status) = &self.dalamud {
-            match &status.install_state {
-                InstallState::Ready => (
-                    format!(
-                        "已安装 {}",
-                        status
-                            .local_assembly_version
-                            .as_deref()
-                            .unwrap_or("未知版本")
+        let (main, detail, color) =
+            if self.config.launch.method != eorzea::config::SdoLaunchMethod::Injector {
+                (
+                    "不可用".into(),
+                    "原版 DLL 启动途径不加载 Dalamud。".into(),
+                    MUTED,
+                )
+            } else if !self.config.dalamud.enabled {
+                ("已关闭".into(), "在「启动」区启用后加载".into(), MUTED)
+            } else if self.dalamud_loading {
+                ("检查中…".into(), "正在核对本地安装与游戏版本".into(), MUTED)
+            } else if let Some(status) = &self.dalamud {
+                match &status.install_state {
+                    InstallState::Ready => (
+                        format!(
+                            "已安装 {}",
+                            status
+                                .local_assembly_version
+                                .as_deref()
+                                .unwrap_or("未知版本")
+                        ),
+                        if status.remote_from_cache {
+                            "版本匹配 · 使用本地元数据缓存".into()
+                        } else {
+                            "版本匹配，启动时加载".into()
+                        },
+                        GREEN,
                     ),
-                    if status.remote_from_cache {
-                        "版本匹配 · 使用本地元数据缓存".into()
-                    } else {
-                        "版本匹配，启动时加载".into()
-                    },
-                    GREEN,
-                ),
-                InstallState::Missing => {
-                    ("未安装".into(), "启动时自动准备 release".into(), WARNING)
+                    InstallState::Missing => {
+                        ("未安装".into(), "启动时自动准备 release".into(), WARNING)
+                    }
+                    InstallState::OutOfDate => (
+                        "需要更新".into(),
+                        format!("本地游戏版本 {}", status.local_game_ver),
+                        WARNING,
+                    ),
+                    InstallState::Unsupported => (
+                        "暂不兼容".into(),
+                        format!("release 尚未支持游戏版本 {}", status.local_game_ver),
+                        RED,
+                    ),
+                    InstallState::RuntimeMissing => (
+                        "缺少 .NET Runtime".into(),
+                        "启动时自动准备 Windows x64 runtime".into(),
+                        WARNING,
+                    ),
+                    InstallState::AssetsMissing => {
+                        ("缺少 Assets".into(), "启动时自动准备资源".into(), WARNING)
+                    }
+                    InstallState::Failed(error) => ("安装异常".into(), error.clone(), RED),
                 }
-                InstallState::OutOfDate => (
-                    "需要更新".into(),
-                    format!("本地游戏版本 {}", status.local_game_ver),
+            } else {
+                (
+                    "无法获取状态".into(),
+                    "启动时重新检查；准备失败不会启动游戏。".into(),
                     WARNING,
-                ),
-                InstallState::Unsupported => (
-                    "暂不兼容".into(),
-                    format!("release 尚未支持游戏版本 {}", status.local_game_ver),
-                    RED,
-                ),
-                InstallState::RuntimeMissing => (
-                    "缺少 .NET Runtime".into(),
-                    "启动时自动准备 Windows x64 runtime".into(),
-                    WARNING,
-                ),
-                InstallState::AssetsMissing => {
-                    ("缺少 Assets".into(), "启动时自动准备资源".into(), WARNING)
-                }
-                InstallState::Failed(error) => ("安装异常".into(), error.clone(), RED),
-            }
-        } else {
-            (
-                "无法获取状态".into(),
-                "启动时重新检查；准备失败不会启动游戏。".into(),
-                WARNING,
-            )
-        };
+                )
+            };
         cards.push(("Dalamud", main, detail, color));
         #[cfg(not(target_os = "windows"))]
         cards.push((
@@ -334,9 +355,46 @@ impl App {
                 area,
                 areas: self.areas.clone(),
                 wine,
-                dalamud: self.dalamud_this_launch,
+                dalamud: self.config.launch.method
+                    == eorzea::config::SdoLaunchMethod::Injector
+                    && self.config.dalamud.enabled,
+                launch_method: self.config.launch.method,
             },
         );
+    }
+    /// 主页开关与设置页共用同一份配置，点击后立即保存。
+    pub(super) fn set_dalamud_enabled(&mut self, value: bool) {
+        if self.critical_busy() || self.modal_open() || self.dalamud_pending.is_some() {
+            return;
+        }
+        let previous = self.config.dalamud.enabled;
+        if previous == value {
+            return;
+        }
+        self.config.dalamud.enabled = value;
+        self.draft.dalamud.enabled = value;
+        self.dalamud_pending = Some(previous);
+        backend::save_dalamud_enabled(&self.runtime, self.bus.clone(), value);
+    }
+    /// 主页切换途径立即持久化，不改动 Dalamud 开关。
+    /// 先更新界面再写盘，避免控件在保存往返期间变灰或跳回旧值。
+    pub(super) fn set_launch_method(&mut self, index: usize) {
+        if self.critical_busy() || self.modal_open() || self.launch_method_pending.is_some() {
+            return;
+        }
+        let method = if index == 1 {
+            eorzea::config::SdoLaunchMethod::SdoDll
+        } else {
+            eorzea::config::SdoLaunchMethod::Injector
+        };
+        let previous = self.config.launch.method;
+        if previous == method {
+            return;
+        }
+        self.config.launch.method = method;
+        self.draft.launch.method = method;
+        self.launch_method_pending = Some((method, previous));
+        backend::save_launch_method(&self.runtime, self.bus.clone(), method);
     }
 }
 pub(super) fn launch_button(label: &str, enabled: bool) -> Element<'_, Msg> {

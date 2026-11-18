@@ -108,6 +108,9 @@ enum Command {
         /// 强制禁用 Dalamud（覆盖 [dalamud].enabled）
         #[arg(long, conflicts_with = "dalamud")]
         no_dalamud: bool,
+        /// 国服启动途径（覆盖 [launch].method；与 Dalamud 开关独立）
+        #[arg(long, value_parser = ["injector", "sdo_dll"])]
+        launch_method: Option<String>,
     },
 }
 
@@ -388,6 +391,7 @@ async fn main() {
             wine,
             dalamud,
             no_dalamud,
+            launch_method,
         } => {
             let override_enabled = if dalamud {
                 Some(true)
@@ -408,6 +412,13 @@ async fn main() {
                 account.as_deref(),
                 wine.as_deref(),
                 override_enabled,
+                launch_method.as_deref().map(|method| {
+                    if method == "sdo_dll" {
+                        eorzea::config::SdoLaunchMethod::SdoDll
+                    } else {
+                        eorzea::config::SdoLaunchMethod::Injector
+                    }
+                }),
             )
             .await;
         }
@@ -711,11 +722,12 @@ async fn run_update_queue(
 
 /// `game verify`：校验游戏文件完整性 + 版本状态。
 async fn cmd_verify(game_path: &std::path::Path) {
-    use eorzea::game_files::verify::{IssueSeverity, verify_game};
+    use eorzea::game_files::verify::{IssueSeverity, verify_game_for_launch};
 
     banner(format!("校验游戏文件  {}", game_path.display()));
     let sp = ui::Spinner::new("扫描 SQPack 索引与文件大小");
-    let issues = verify_game(game_path, 5);
+    let method = eorzea::config::load_app_default().launch.method;
+    let issues = verify_game_for_launch(game_path, 5, method);
     sp.clear();
 
     // 版本状态检查（免登录）：本地 vs 服务器最新
@@ -1016,6 +1028,7 @@ async fn cmd_launch(
     account: Option<&str>,
     wine: Option<&std::path::Path>,
     dalamud_override: Option<bool>,
+    launch_method: Option<eorzea::config::SdoLaunchMethod>,
 ) {
     // CLI 只解析输入、展示进度；认证、凭据轮换和启动与 GUI 共用核心库流程。
     let mut launcher = Launcher::new()
@@ -1048,6 +1061,13 @@ async fn cmd_launch(
         game_path.display()
     ));
 
+    kv(
+        "启动途径",
+        launch_method
+            .unwrap_or_else(|| eorzea::config::load_app_default().launch.method)
+            .label(),
+    );
+
     let cfg_path = eorzea::auth::config_path();
     let mut bar: Option<ui::ByteBar> = None;
     let mut spinner: Option<ui::Spinner> = None;
@@ -1062,6 +1082,7 @@ async fn cmd_launch(
                 areas,
                 wine: launcher.wine_settings(),
                 dalamud: dalamud_override,
+                launch_method,
             },
             |event| match event {
                 LaunchEvent::DalamudProgress(phase, done, total) => {
@@ -1133,9 +1154,9 @@ async fn cmd_launch(
                 hint("详细输出见上方日志（`-v` 可看更多）");
             }
             match e {
-                LauncherError::DalamudNotReady(_) => {
-                    hint("本次不会启动游戏。修复后重试，或用 `eoz launch --no-dalamud` 本次跳过。")
-                }
+                LauncherError::DalamudNotReady(_) => hint(
+                    "本次不会启动游戏。关闭 Dalamud 仍需 Injector / ArgFixer 就绪；可修复后重试，或显式选择 `--launch-method sdo_dll --no-dalamud`。",
+                ),
                 LauncherError::Auth(_) => hint(
                     "请先检查上方错误；若 session key 已过期，用 `eoz auth login qr` 重新登录。",
                 ),
@@ -1257,7 +1278,7 @@ async fn cmd_dalamud_status(game_path: &std::path::Path) {
 
     if !st.remote_supported() {
         hint(
-            "游戏更新、release 未跟进的期间，`eoz launch` 会直接报错，可用 `--no-dalamud` 先进游戏",
+            "游戏更新、release 未跟进时 Injector 途径会报错，`--no-dalamud` 不绕过 ArgFixer 版本门控",
         );
     }
 }
@@ -1365,7 +1386,16 @@ async fn cmd_dalamud_launch(
     area: &str,
     dalamud_override: Option<bool>,
 ) {
-    cmd_launch(game_path, area, None, None, dalamud_override.or(Some(true))).await;
+    // 这个子命令承诺“通过 Injector 启动”，因此不受 [launch].method 影响。
+    cmd_launch(
+        game_path,
+        area,
+        None,
+        None,
+        dalamud_override.or(Some(true)),
+        Some(eorzea::config::SdoLaunchMethod::Injector),
+    )
+    .await;
 }
 
 // ── eoz config：类似 git config 的 config.toml 读写 ─────────────────────
@@ -1395,18 +1425,22 @@ fn config_key_spec(key: &str) -> Option<ConfigValueKind> {
     Some(match key {
         "game_path"
         | "area"
+        | "launch.method"
+        | "launcher_update.channel"
+        | "launcher_update.source"
         | "dalamud.load_method"
         | "dalamud.track"
         | "dalamud.beta_key"
         | "dalamud.install_root" => ConfigValueKind::String,
-        "dalamud.enabled"
+        "launcher_update.check_on_startup"
+        | "dalamud.enabled"
         | "dalamud.no_plugins"
         | "dalamud.no_third_party_plugins"
         | "dalamud.manage_runtime" => ConfigValueKind::Bool,
         "dalamud.delay_initialize_ms" | "download.concurrency" | "download.min_concurrency" => {
             ConfigValueKind::Uint
         }
-        "dalamud" | "download" => ConfigValueKind::Table,
+        "dalamud" | "download" | "launcher_update" | "launch" => ConfigValueKind::Table,
         #[cfg(not(target_os = "windows"))]
         "startup_type" | "custom_path" | "prefix" | "debug_vars" | "dxvk.hud" => {
             ConfigValueKind::String
@@ -1432,16 +1466,66 @@ fn parse_bool(raw: &str) -> Option<bool> {
 fn validate_string_enum(key: &str, value: &str) -> Result<(), String> {
     let valid = match key {
         "startup_type" => ["auto", "managed", "custom", "system"].contains(&value),
+        "launch.method" => ["injector", "sdo_dll"].contains(&value),
         "dalamud.load_method" => ["entrypoint", "dllinject", "aclonly"].contains(&value),
+        "launcher_update.channel" => ["auto", "stable", "dev"].contains(&value),
+        "launcher_update.source" => ["auto", "mirror", "github"].contains(&value),
         _ => true,
     };
     if valid {
         Ok(())
     } else {
         Err(format!(
-            "{key} 的值 {value:?} 无效（startup_type: auto/managed/custom/system；dalamud.load_method: entrypoint/dllinject/aclonly）"
+            "{key} 的值 {value:?} 无效（launch.method: injector/sdo_dll；startup_type: auto/managed/custom/system；dalamud.load_method: entrypoint/dllinject/aclonly；launcher_update.channel: auto/stable/dev；launcher_update.source: auto/mirror/github）"
         ))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn launch_route_cli_and_config_are_typed() {
+    assert_eq!(
+        config_key_spec("launch.method"),
+        Some(ConfigValueKind::String)
+    );
+    assert!(validate_string_enum("launch.method", "sdo_dll").is_ok());
+    assert!(validate_string_enum("launch.method", "invalid").is_err());
+    let cli = Cli::try_parse_from([
+        "eoz",
+        "launch",
+        "--launch-method",
+        "sdo_dll",
+        "--no-dalamud",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Command::Launch { launch_method: Some(method), no_dalamud: true, .. } if method == "sdo_dll")
+    );
+    assert!(Cli::try_parse_from(["eoz", "launch", "--launch-method", "invalid"]).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn launcher_update_config_keys_are_typed_and_validate_enums() {
+    assert_eq!(
+        config_key_spec("launcher_update"),
+        Some(ConfigValueKind::Table)
+    );
+    assert_eq!(
+        config_key_spec("launcher_update.check_on_startup"),
+        Some(ConfigValueKind::Bool)
+    );
+    assert_eq!(
+        parse_config_value("launcher_update.channel", "dev").unwrap(),
+        toml::Value::String("dev".into())
+    );
+    assert_eq!(
+        parse_config_value("launcher_update.source", "mirror").unwrap(),
+        toml::Value::String("mirror".into())
+    );
+    assert!(parse_config_value("launcher_update.channel", "unknown").is_err());
+    assert!(parse_config_value("launcher_update.source", "https://example.com").is_err());
+    assert_eq!(config_key_spec("launcher_update.auto_install"), None);
 }
 
 /// 把命令行字符串按 key 的类型转成 TOML value。

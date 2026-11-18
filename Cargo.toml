@@ -3,6 +3,11 @@ members = ["packages/eorzea-app", "packages/eorzea-auth", "packages/eorzea-cli"]
 # 默认成员 = CLI：`cargo run` / `cargo check` 不连带编译 GUI。
 # GUI：`cargo run -p eorzea-app`。
 default-members = ["packages/eorzea-cli"]
+exclude = ["vendor/iced_tiny_skia"]
+
+[patch.crates-io]
+# Always clip editor glyphs, including partially visible lines during scrolling.
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
 
 [package]
 name = "eorzea"

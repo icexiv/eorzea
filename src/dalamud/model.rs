@@ -240,6 +240,13 @@ mod tests {
         assert!(args.contains(&"--game=Z:\\Games\\ffxiv\\game\\ffxiv_dx11.exe".to_string()));
         assert!(args.contains(&"--".to_string()));
         assert!(args.contains(&"-AppID=100001900".to_string()));
+        assert!(!args.contains(&"--without-dalamud".to_string()));
+        for mode in [DalamudLoadMethod::EntryPoint, DalamudLoadMethod::DllInject] {
+            let args = build_injector_launch_args(&start, mode, &game_args, true);
+            let without = args.iter().position(|a| a == "--without-dalamud").unwrap();
+            assert!(without < args.iter().position(|a| a == "--").unwrap());
+            assert_eq!(args.last(), game_args.last());
+        }
     }
 
     #[test]

@@ -6,7 +6,6 @@ use iced::{Element, Fill};
 
 pub const HEIGHT: f32 = 36.;
 pub const DRAWER_HEIGHT: f32 = 240.;
-const VERSION: &str = concat!("Eorzea ", env!("CARGO_PKG_VERSION"));
 
 fn log_color(level: LogLevel) -> iced::Color {
     match level {
@@ -25,7 +24,6 @@ mod tests {
         assert_eq!(preview("陆行鸟大区初始化完成", 50.), "陆行鸟…");
         assert_eq!(preview("short", 100.), "short");
         assert_eq!(preview("long", 1.), "…");
-        assert!(VERSION.ends_with(env!("CARGO_PKG_VERSION")));
     }
 }
 /// Conservative width budget; clipping also protects against unusual font metrics.
@@ -78,6 +76,20 @@ impl App {
         };
         let chevron=svg(svg::Handle::from_memory(format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='#71717a' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><path d='{path}'/></svg>").into_bytes())).width(16).height(16);
         let enabled = !self.modal_open();
+        let version = self.build_info.display();
+        let label = if self.launcher_update_available() {
+            "发现启动器新版".to_owned()
+        } else {
+            preview(&version, 260.)
+        };
+        let version = tooltip(
+            button(text(label).size(12))
+                .padding([4, 0])
+                .style(quiet)
+                .on_press_maybe(enabled.then_some(Msg::ShowLauncherUpdate)),
+            container(text(version).size(12)).padding(10).style(panel),
+            tooltip::Position::Top,
+        );
         let toggle = motion::press(
             button(
                 row![text("日志").size(12), chevron]
@@ -94,7 +106,7 @@ impl App {
             container(space()).height(1).width(Fill).style(divider),
             container(
                 row![
-                    text(VERSION).size(12).color(MUTED),
+                    version,
                     space().width(12),
                     tooltip(
                         log,

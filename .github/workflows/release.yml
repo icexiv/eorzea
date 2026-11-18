@@ -98,6 +98,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libfontconfig1-dev
       - name: Build independent App and CLI binaries
+        env:
+          EORZEA_BUILD_VERSION: ${{ needs.plan.outputs.version }}
+          EORZEA_BUILD_CHANNEL: ${{ needs.plan.outputs.channel }}
+          EORZEA_BUILD_COMMIT: ${{ github.sha }}
+          EORZEA_BUILD_NUMBER: ${{ github.run_number }}
+          EORZEA_BUILD_ATTEMPT: ${{ github.run_attempt }}
+          EORZEA_DISTRIBUTION: ${{ needs.plan.outputs.publish == 'true' && 'portable' || 'source' }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p eorzea-app -p eorzea-cli
       - name: Package App and CLI separately
         shell: bash

@@ -9,6 +9,7 @@
 - Windows 原生启动，Linux / macOS 通过 Wine 启动
 - Dalamud 插件框架集成
 - 图形界面与命令行工具共享账号和配置
+- 启动器版本检查，支持稳定版/开发版和国内镜像；Nix 包仅检查、不下载安装
 
 ## 下载
 
@@ -17,11 +18,13 @@
 - **`eorzea-app`**：图形界面（GUI），普通用户通常选择这个。
 - **`eoz`**：命令行工具（CLI），在终端中使用，不需要同时下载 GUI。
 
-所有平台均直接提供独立可执行文件，无需解压。Windows 下载对应的 `.exe` 直接运行；Linux / macOS 下载对应的二进制文件，执行 `chmod +x <文件名>` 后运行。需要使用 `eoz` 命令时，可将下载的 CLI 文件重命名为 `eoz.exe`（Windows）或 `eoz`（Linux/macOS），再加入 `PATH`。
+Windows 提供独立 App / CLI ZIP，Linux 提供独立 tar.gz，解压后运行其中的 `eorzea-app` 或 `eoz`。macOS App 使用 DMG，CLI 使用 tar.gz。旧开发构建附件可能仍为裸二进制，以实际文件名为准。
 
 提供 Linux x86_64、Windows x86_64 和 macOS arm64 构建。macOS 尚未经过真机验证。
 
 最新开发构建见 [Development build](https://github.com/icexiv/eorzea/releases/tag/dev-build)，可能不稳定。
+
+Nix 用户可构建本项目 flake 的 `eorzea-app`（默认）或 `eorzea-cli` 包，见 [Nix 安装与更新](docs/nix.md)。GUI 的「设置 → 启动器更新」可手动检查，也可在启动时后台检查；当前阶段所有分发均需手动安装，Nix 包只提供包管理器升级指引。
 
 ## 快速开始
 
@@ -86,6 +89,7 @@ debug 文件含调试信息，不能当作发行体积；可执行文件大小�
 - [Wine 与 DXVK](docs/wine.md)
 - [Dalamud](docs/dalamud.md)
 - [NixOS](docs/notes/nixos.md)
+- [Nix 安装与更新](docs/nix.md)
 - [已知问题与待办](TODO.md)
 
 ## 致谢
