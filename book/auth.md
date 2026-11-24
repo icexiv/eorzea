@@ -1,10 +1,10 @@
-= auth.toml：账号与自动登录凭据
+# auth.toml：账号与自动登录凭据
 
-GUI 与 CLI（`eoz`）共用 `~/.eorzea/auth.toml`。Windows 上路径为 `C:\Users\<用户>\.eorzea\auth.toml`。游戏目录、Wine、DXVK 与 Dalamud 配置见 [config.toml](config.not)。
+GUI 与 CLI（`eoz`）共用 `~/.eorzea/auth.toml`。Windows 上路径为 `C:\Users\<用户>\.eorzea\auth.toml`。游戏目录、Wine、DXVK 与 Dalamud 配置见 [config.toml](config.md)。
 
 这个文件保存 SDO（盛趣 / 中国服）账号记录，通常交给登录页或 `eoz auth` 管理，不需要手工填写。当前结构不保存账号密码。
 
-== 顶层字段
+## 顶层字段
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -13,7 +13,7 @@ GUI 与 CLI（`eoz`）共用 `~/.eorzea/auth.toml`。Windows 上路径为 `C:\Us
 
 default_account 应匹配已有记录；无法匹配时不会得到有效默认账号。账号名与 snda_id 均按字符串精确匹配，建议通过 CLI 或 GUI 选择默认账号。
 
-== 每个账号的字段
+## 每个账号的字段
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -24,7 +24,7 @@ default_account 应匹配已有记录；无法匹配时不会得到有效默认�
 
 可选字段未设置时应省略，不要写成空字符串；保存时未设置的可选字段也会省略。单条记录缺少必填的 snda_id 会导致整个文件解析失败，并按空账号配置处理。
 
-== 示例
+## 示例
 
 以下全部为占位值，不能用于实际登录。
 
@@ -42,7 +42,7 @@ snda_id = "0987654321"
 # 没有账号名、session key 或默认大区的记录可以省略对应字段。
 ```
 
-== 管理方式
+## 管理方式
 
 ```sh
 eoz auth login qr
@@ -59,13 +59,13 @@ eoz auth logout
 - 文件不存在时尝试从 ~/.eorzea/eorzea.toml 迁移，旧文件不删除；没有可迁移内容时返回空配置。
 - 新安装通常在首次保存登录账号时才创建 auth.toml；读取失败或解析失败会回退为空配置。保存会重写文件，不保留注释。
 
-== Session key 的生命周期与安全
+## Session key 的生命周期与安全
 
 每次自动登录成功，服务端会下发新的 session key，旧 key 随即作废。启动器会及时将新 key 写回文件；不要用旧备份覆盖正在使用的凭据，也不要让多个客户端同时使用同一个 key 登录。
 
 有效期由服务端决定，登录输出会显示剩余期限。过期或失效后，需要重新扫码或密码登录获取凭据。
 
-*auth.toml 是含凭据的明文文件。* 不要提交到 Git，不要在 issue、日志或截图中公开 auto_login_session_key。分享配置时也应隐藏账号名与账号 ID。beta key 等其他敏感配置同样不应公开。
+**auth.toml 是含凭据的明文文件。** 不要提交到 Git，不要在 issue、日志或截图中公开 auto_login_session_key。分享配置时也应隐藏账号名与账号 ID。beta key 等其他敏感配置同样不应公开。
 
 当前保存逻辑没有加密，也没有主动设置仅当前用户可读的权限；文件权限受系统与 umask 影响。在 Linux / macOS 上可以自行收紧权限：
 
