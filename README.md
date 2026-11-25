@@ -1,6 +1,16 @@
+<p align="center">
+  <img src="assets/eorzea.png" width="160" height="160" alt="Eorzea：水晶塔与 IceXIV 冰方块" />
+</p>
+
 # eorzea
 
 使用 Rust 编写的《最终幻想 XIV》国服（盛趣）第三方启动器，提供图形界面和命令行工具。
+
+## 项目标识
+
+Logo 以游戏内水晶塔的主塔、晶体切面与入口为主体，左上后方露出部分 IceXIV 冰方块，使用透明背景。
+原图位于 `assets/logo.png`；`assets/eorzea.png` 为 512px 展示版，供 README、窗口图标与 Linux 桌面菜单使用。
+Windows 可执行文件嵌入 `assets/eorzea.ico`，macOS App 包使用 `assets/eorzea.icns`；IceXIV 主页与本仓库共用同一份 512px PNG。
 
 ## 功能
 
