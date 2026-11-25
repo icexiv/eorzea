@@ -4,31 +4,31 @@
   "channels": {
     "stable": null,
     "dev": {
-      "version": "dev-4953d6c-10-1",
+      "version": "dev-27956ce-12-1",
       "tag": "dev-build",
-      "commit": "4953d6c159082d64660c5412142b686b3b179c4e",
-      "build": 10,
+      "commit": "27956ce37c604ed6510bbf13c232c8834e1d1201",
+      "build": 12,
       "published_at": "2026-11-10T13:08:20Z",
       "assets": {
         "linux-x86_64": {
-          "filename": "eorzea-app-dev-4953d6c-10-1-linux-x86_64.tar.gz",
-          "url": "https://github.com/icexiv/eorzea/releases/download/dev-build/eorzea-app-dev-4953d6c-10-1-linux-x86_64.tar.gz",
-          "sha256": "732038802a2c31a40e7b1a9b3cc005132c73c6c699f4857bddc0cecee2121f92",
-          "size": 7742932,
+          "filename": "eorzea-app-dev-27956ce-12-1-linux-x86_64.tar.gz",
+          "url": "https://github.com/icexiv/eorzea/releases/download/dev-build/eorzea-app-dev-27956ce-12-1-linux-x86_64.tar.gz",
+          "sha256": "242831aa9e431133fd79eb1fca36dde0240d9684788974b7e70471cdda2268d9",
+          "size": 7925413,
           "experimental": false
         },
         "macos-aarch64": {
-          "filename": "eorzea-app-dev-4953d6c-10-1-macos-aarch64.dmg",
-          "url": "https://github.com/icexiv/eorzea/releases/download/dev-build/eorzea-app-dev-4953d6c-10-1-macos-aarch64.dmg",
-          "sha256": "5ea1d5c7bdb864645c6bc2a5ab2f8ab4e745ccf5a189c2dd9250d299dfbf5126",
-          "size": 6371378,
+          "filename": "eorzea-app-dev-27956ce-12-1-macos-aarch64.dmg",
+          "url": "https://github.com/icexiv/eorzea/releases/download/dev-build/eorzea-app-dev-27956ce-12-1-macos-aarch64.dmg",
+          "sha256": "0cef94c24707c963f9122fd8ea05e10c295dbca07433adc783b8bc3e31bcbe5f",
+          "size": 7391803,
           "experimental": true
         },
         "windows-x86_64": {
-          "filename": "eorzea-app-dev-4953d6c-10-1-windows-x86_64.zip",
-          "url": "https://github.com/icexiv/eorzea/releases/download/dev-build/eorzea-app-dev-4953d6c-10-1-windows-x86_64.zip",
-          "sha256": "bab473cb48990131ddcbc7f8b6fa068bfb5e931923ed4e0e1c9b708b178d864b",
-          "size": 6306355,
+          "filename": "eorzea-app-dev-27956ce-12-1-windows-x86_64.zip",
+          "url": "https://github.com/icexiv/eorzea/releases/download/dev-build/eorzea-app-dev-27956ce-12-1-windows-x86_64.zip",
+          "sha256": "fcbd09a9eb15bb4a91d0be79e36b0825262aecf95d79d5b6df50307a40e022aa",
+          "size": 6603792,
           "experimental": false
         }
       }
