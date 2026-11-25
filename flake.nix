@@ -91,7 +91,12 @@
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
         revision = self.rev or (self.dirtyRev or "unknown");
         packageArgs = {
-          src = packageCraneLib.cleanCargoSource ./.;
+          src = lib.cleanSourceWith {
+            src = ./.;
+            filter = path: type:
+              (packageCraneLib.filterCargoSources path type)
+              || builtins.elem (baseNameOf path) [ "eorzea.png" "eorzea.ico" "resources.rc" ];
+          };
           inherit version;
           pname = "eorzea";
           strictDeps = true;
@@ -131,7 +136,7 @@
                     --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath guiSystemLibs}" \
                     --prefix PATH : "${lib.makeBinPath [ pkgs.xdg-utils ]}"
                   install -Dm644 ${./assets/eorzea.desktop} "$out/share/applications/eorzea.desktop"
-                  install -Dm644 ${./assets/eorzea.svg} "$out/share/icons/hicolor/scalable/apps/eorzea.svg"
+                  install -Dm644 ${./assets/eorzea.png} "$out/share/icons/hicolor/512x512/apps/eorzea.png"
                 ''
               );
               meta = {

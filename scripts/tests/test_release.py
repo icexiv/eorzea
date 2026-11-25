@@ -2,6 +2,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import plistlib
 import tempfile
 import tomllib
 import unittest
@@ -104,3 +105,18 @@ class ReleaseTests(unittest.TestCase):
         with tarfile.open(self.dist / "eorzea-app-dev-test-linux-x86_64.tar.gz") as package:
             self.assertEqual(package.getnames(), ["eorzea-app"])
             self.assertEqual(package.getmember("eorzea-app").mode & 0o777, 0o755)
+
+    def test_macos_app_bundle_contains_registered_icon(self):
+        target = self.repo / "target"
+        target.mkdir()
+        for binary in ("eorzea-app", "eoz"):
+            (target / binary).write_bytes(b"executable")
+        with patch.object(release.subprocess, "run"):
+            release.package(target, "macos-aarch64", "dev-test", self.dist)
+        bundle = self.dist / "macos-staging/Eorzea.app/Contents"
+        with (bundle / "Info.plist").open("rb") as file:
+            info = plistlib.load(file)
+        self.assertEqual(info["CFBundleIconFile"], "eorzea.icns")
+        self.assertEqual((bundle / "Resources" / info["CFBundleIconFile"]).read_bytes(),
+                         (ROOT / "assets/eorzea.icns").read_bytes())
+        self.assertEqual((bundle / "MacOS/eorzea-app").read_bytes(), b"executable")

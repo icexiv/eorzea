@@ -1,8 +1,8 @@
-= config.toml：启动器配置
+# config.toml：启动器配置
 
-GUI 与 CLI（`eoz`）共用 `~/.eorzea/config.toml`。Windows 上路径为 `C:\Users\<用户>\.eorzea\config.toml`。账号与自动登录凭据不在这里，见 [auth.toml](auth.not)。
+GUI 与 CLI（`eoz`）共用 `~/.eorzea/config.toml`。Windows 上路径为 `C:\Users\<用户>\.eorzea\config.toml`。账号与自动登录凭据不在这里，见 [auth.toml](auth.md)。
 
-== 读写与默认值
+## 读写与默认值
 
 - 首次读取时，若没有配置或可迁移的旧文件，会创建只有注释的模板；默认值由程序提供。
 - 缺少字段使用对应默认值。可选字段的“未设置”表示省略该键，不是空字符串，也不是 TOML 中的 null。
@@ -20,17 +20,17 @@ eoz config set dxvk.hud fps
 eoz config unset dxvk.hud
 ```
 
-== 游戏与大区
+## 游戏与大区
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `game_path` | 路径字符串，可选 | 未设置 | 游戏根目录，包含 boot/、game/、sdo/。CLI 的 --game-path 可单次覆盖。 |
-| `area` | 字符串，可选 | 未设置 | *旧版全局默认大区*（名称，如 "陆行鸟"；也兼容旧数字 ID）。默认大区现在按账号保存在 auth.toml；仅在该账号没有 area 时回退到这里，GUI 不再编辑。CLI 的 --area 仍可单次覆盖。 |
+| `area` | 字符串，可选 | 未设置 | **旧版全局默认大区**（名称，如 "陆行鸟"；也兼容旧数字 ID）。默认大区现在按账号保存在 auth.toml；仅在该账号没有 area 时回退到这里，GUI 不再编辑。CLI 的 --area 仍可单次覆盖。 |
 
 大区解析顺序为：--area（名称）→ 账号的 area（名称）→ 这里的 area → 大区列表第一个。不同大区使用不同的补丁服务器，隐式选择会打印提示。
 
 
-== 补丁下载
+## 补丁下载
 
 GUI 设置页的「补丁下载」与 CLI 共用 [download]，保存后从下次更新任务生效。
 
@@ -47,7 +47,7 @@ concurrency = 8
 min_concurrency = 4
 ```
 
-== 国服启动途径
+## 国服启动途径
 
 所有平台使用 `[launch]`，与 `[dalamud].enabled` 分开保存。GUI 设置页「启动」区、主页启动区可切换，主页切换立即写入配置；CLI 用 --launch-method 单次覆盖。
 
@@ -68,7 +68,7 @@ method = "injector"
 enabled = false
 ```
 
-== 启动器版本检查
+## 启动器版本检查
 
 `[launcher_update]` 只由 GUI 使用，CLI 不自动联网检查。手动检查使用已保存设置并绕过缓存；启动检查后台执行，失败不阻断登录或游戏启动。
 
@@ -80,9 +80,9 @@ enabled = false
 
 检查只获取版本清单，不下载或替换程序。Nix 包由包管理器更新；不提供覆盖 Nix store 的选项。游戏补丁与 Dalamud 更新不受此设置影响。
 
-== Wine（仅 Linux / macOS）
+## Wine（仅 Linux / macOS）
 
-Wine 字段直接平铺在顶层，*没有 [wine] 表*。Windows 原生启动不使用这些字段，读取时忽略，保存时移除；Windows 的 CLI 也不接受这些配置键。
+Wine 字段直接平铺在顶层，**没有 [wine] 表**。Windows 原生启动不使用这些字段，读取时忽略，保存时移除；Windows 的 CLI 也不接受这些配置键。
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -95,7 +95,7 @@ Wine 字段直接平铺在顶层，*没有 [wine] 表*。Windows 原生启动不
 | `debug_vars` | 字符串，可选 | 未设置 | WINEDEBUG，例如 "+seh" 或 "-all"。 |
 | `gamemode` | 布尔值 | false | 仅 Linux 生效，开启时向 LD_PRELOAD 追加 libgamemodeauto.so.0；其他平台忽略。 |
 
-=== startup_type 的取值
+### startup_type 的取值
 
 - `auto`：依次尝试 custom_path、XIVLauncher 已有的 Wine、系统 PATH 中的 wine64/wine；都没有时复用本项目已下载的 Wine，或下载。
 - `managed`：优先复用 ~/.xlcore/beta/wine/bin/wine64，再尝试 ~/.eorzea/tools/wine/bin/wine64，最后下载。
@@ -104,9 +104,9 @@ Wine 字段直接平铺在顶层，*没有 [wine] 表*。Windows 原生启动不
 
 托管 Wine 下载到 `~/.eorzea/tools/wine/`。下载版本与地址由代码固定，目前没有多版本安装列表或自动升级设置。
 
-*Prefix 数据安全：当前实现会删除并重建 32 位或无法识别架构的 prefix。* 请使用专用目录，不要将 prefix 指向已有重要数据的共享环境。缺少 prefix 时会创建 64 位环境。
+**Prefix 数据安全：当前实现会删除并重建 32 位或无法识别架构的 prefix。** 请使用专用目录，不要将 prefix 指向已有重要数据的共享环境。缺少 prefix 时会创建 64 位环境。
 
-== DXVK（仅 Linux / macOS）
+## DXVK（仅 Linux / macOS）
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -114,7 +114,7 @@ Wine 字段直接平铺在顶层，*没有 [wine] 表*。Windows 原生启动不
 | `dxvk.hud` | 字符串，可选 | 未设置 | DXVK_HUD，例如 "fps"、"full"、"0"。 |
 | `dxvk.frame_limit` | u32，可选 | 未设置 | DXVK_FRAME_RATE 帧率上限；未设置时不由此配置限制。 |
 
-== 自定义环境变量（仅 Linux / macOS）
+## 自定义环境变量（仅 Linux / macOS）
 
 `[env]` 是字符串到字符串的映射，默认为空。所有值都需要写成字符串。环境变量最后应用，可以覆盖程序生成的 WINEPREFIX、WINEDEBUG、DXVK 变量及 DLL overrides。覆盖 WINEDLLOVERRIDES 时需自行保留需要的其他项。
 
@@ -123,7 +123,7 @@ Wine 字段直接平铺在顶层，*没有 [wine] 表*。Windows 原生启动不
 WINEDEBUG = "-all"
 ```
 
-== Dalamud
+## Dalamud
 
 所有平台均支持 `[dalamud]`。
 
@@ -141,7 +141,7 @@ WINEDEBUG = "-all"
 
 启用 Dalamud 后，元数据获取失败、游戏版本不兼容、下载或校验失败、runtime/assets 不完整都会阻止游戏启动；不会静默回退为无插件启动。排障时请显式关闭 Dalamud。
 
-== Linux / macOS 示例
+## Linux / macOS 示例
 
 这是显式配置示例，不是首次运行生成的模板。可按需删除字段以恢复程序默认值。
 
@@ -174,7 +174,7 @@ manage_runtime = false
 track = "release"
 ```
 
-== Windows 示例
+## Windows 示例
 
 ```toml
 game_path = "G:/FF14"

@@ -37,10 +37,14 @@ def package(target, platform, version, output):
             bundle = output / "macos-staging" / "Eorzea.app" / "Contents"
             (bundle / "MacOS").mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, bundle / "MacOS" / "eorzea-app")
+            (bundle / "Resources").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(__file__).resolve().parents[1] / "assets/eorzea.icns",
+                         bundle / "Resources/eorzea.icns")
             with (bundle / "Info.plist").open("wb") as file:
                 app_version = tomllib.loads((Path(__file__).resolve().parents[1] / "Cargo.toml").read_text())["package"]["version"]
                 plistlib.dump({"CFBundleExecutable": "eorzea-app", "CFBundleName": "Eorzea",
                     "CFBundleIdentifier": "top.icexiv.eorzea", "CFBundlePackageType": "APPL",
+                    "CFBundleIconFile": "eorzea.icns",
                     "CFBundleShortVersionString": app_version.split("-")[0],
                     "CFBundleVersion": os.environ.get("GITHUB_RUN_NUMBER", "1"),
                     "NSHighResolutionCapable": True}, file)
